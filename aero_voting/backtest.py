@@ -29,6 +29,7 @@ STEP_H = 48      # a bot re-allocates on the first full hour after the cooldown
 # ----------------------------------------------------------------------------- data
 def load_prices() -> pd.DataFrame:
     p = pd.read_csv(os.path.join(DATA, "prices.csv"))
+    p = p[(p.price > 0) & (p.price < 1e7)]  # drop absurd pool-spot fallbacks (empty pools)
     p["token"] = p.token.str.lower()
     p["hour"] = (p.ts // H) * H
     return p.groupby(["token", "hour"]).price.mean().reset_index()
@@ -41,7 +42,7 @@ def price_lookup(prices: pd.DataFrame, hours: np.ndarray) -> pd.DataFrame:
     return tab.loc[hours]
 
 
-def build_panel(verbose=True):
+def build_panel(verbose=True, drop_first_release=True):
     gauges = pd.read_csv(os.path.join(DATA, "gauges.csv"))
     fees = pd.read_csv(os.path.join(DATA, "fee_events.csv"))
     inc = pd.read_csv(os.path.join(DATA, "incentives.csv"))
@@ -65,6 +66,12 @@ def build_panel(verbose=True):
     # --- fees: value each release, and the exact per-VP credit at release time
     fees["hour"] = (fees.ts // H) * H
     fees["usd"] = usd(fees.token, fees.amount_f, fees.hour)
+    # A gauge's first release per token dumps everything that piled up while nobody was allocated. Only whoever
+    # happened to be first gets it, and it never repeats, so it is excluded from both signal and realised P&L.
+    fees["is_first"] = ~fees.duplicated(["gauge", "token"], keep="first")
+    first_usd = fees.loc[fees.is_first, "usd"].fillna(0).sum()
+    if drop_first_release:
+        fees = fees[~fees.is_first].copy()
     unpriced = fees.usd.isna().sum()
     fees["usd"] = fees.usd.fillna(0.0)
     fees["usd_per_vp"] = np.where(fees.supply > 0, fees.usd / fees.supply, 0.0)
@@ -91,7 +98,7 @@ def build_panel(verbose=True):
     if verbose:
         print(f"panel: {panel.gauge.nunique()} gauges x {panel.hour.nunique()} hours, "
               f"fees ${panel.fees_usd.sum():,.0f}, incentives ${panel.inc_usd.sum():,.0f}, "
-              f"{unpriced} unpriced fee events of {len(fees)}, AERO=${aero_px:.4f}")
+              f"{unpriced} unpriced fee events of {len(fees)}, first-release dumps excluded ${first_usd:,.0f}, AERO=${aero_px:.4f}")
     return panel, fees, aero_px
 
 
@@ -272,9 +279,10 @@ def main():
     ap.add_argument("--topn", type=int, default=5)
     ap.add_argument("--cap", type=float, default=0.4, help="max share per gauge for split strategies")
     ap.add_argument("--report", default=None, help="write markdown report to this path")
+    ap.add_argument("--keep-first-release", action="store_true", help="keep each gauge's first fee dump (default: excluded)")
     args = ap.parse_args()
 
-    panel, fees, aero_px = build_panel()
+    panel, fees, aero_px = build_panel(drop_first_release=not args.keep_first_release)
     cube = Cube.from_panel(panel)
     lab = dict(zip(panel.gauge, panel.label))
     cube.gauges_label = [lab[g] for g in cube.gauges]
@@ -299,12 +307,16 @@ def main():
         sens[f"{amt:,.0f}"] = r.apr * 100
     print(pd.DataFrame(sens).T.to_string(float_format=lambda x: f"{x:,.1f}"))
 
-    print("\n== sensitivity: APR % by look-back window (rows), amount=%s ==" % f"{args.amount:,.0f}")
+    print(f"\n== sensitivity: APR % by look-back window (rows), amount={args.amount:,.0f} ==")
     sens = {}
     for w in [24, 48, 96, 168]:
         r, _ = run(cube, args.amount, w, args.topn, args.cap, aero_px, start_h=168)
         sens[f"{w}h"] = r.apr * 100
     print(pd.DataFrame(sens).T.to_string(float_format=lambda x: f"{x:,.1f}"))
+
+    print("\n== signal quality: does the trailing window predict the next 48h? (amount=%s) ==" % f"{args.amount:,.0f}")
+    sig = signal_analysis(cube, args.amount)
+    print(sig.to_string())
 
     print("\n== picks per period (blend_high_x_steady) ==")
     print(log[log.strategy == "blend_high_x_steady"][["hour", "usd", "picks"]].assign(
@@ -318,9 +330,42 @@ def main():
             f.write("## Top gauges\n\n" + gt[cols].head(25).to_markdown(index=False, floatfmt=",.2f") + "\n\n")
             f.write(f"## Walk-forward (amount={args.amount:,.0f}, window={args.window}h, step={STEP_H}h, topN={args.topn}, cap={args.cap:.0%})\n\n")
             f.write(res[["usd", "usd_per_day", "apr_pct", "days"]].to_markdown(floatfmt=",.2f") + "\n\n")
+            f.write("## Signal quality (Spearman IC of trailing score vs next-48h realised USD; hit10 = trailing top-10 still in forward top-20)\n\n" + sig.to_markdown() + "\n\n")
             f.write("## Picks (blend_high_x_steady)\n\n" + log[log.strategy == "blend_high_x_steady"][["hour", "usd", "picks"]].assign(
                 hour=lambda d: pd.to_datetime(d.hour, unit="s")).to_markdown(index=False, floatfmt=",.0f") + "\n")
         print("report written:", args.report)
+
+
+# ----------------------------------------------------------------------------- signal quality
+def signal_analysis(cube: Cube, amount: float = 100_000, windows=(24, 48, 96, 168), horizon=STEP_H) -> pd.DataFrame:
+    """How well does trailing performance predict the next 48h, across gauges?
+    IC = Spearman rank correlation between trailing score and forward realised USD (for `amount`).
+    hit10 = share of trailing top-10 gauges that are still in the forward top-20."""
+    from scipy.stats import spearmanr
+    n_h = len(cube.hours)
+    rows = []
+    for w in windows:
+        for h in range(w, n_h - horizon + 1, horizon):
+            mean, std, cover = expected_rate(cube, amount, h - w, h)
+            fwd = np.array([cube.earn(np.eye(len(cube.gauges))[i], amount, h, h + horizon) for i in range(len(cube.gauges))])
+            ok = (cube.supply[:, h - 1] > 0) | (mean > 0)
+            if ok.sum() < 20:
+                continue
+            with np.errstate(divide="ignore", invalid="ignore"):
+                cv = np.where(mean > 0, std / mean, np.inf)
+            steady = np.where(mean > 0, mean * np.sqrt(cover) / (1 + cv), 0.0)
+            ic_mean = spearmanr(mean[ok], fwd[ok]).correlation
+            ic_steady = spearmanr(steady[ok], fwd[ok]).correlation
+            top50 = np.argsort(-mean)[:50]  # among the gauges that already pay well, is the ordering predictable?
+            ic_top50 = spearmanr(mean[top50], fwd[top50]).correlation
+            ic_top50_steady = spearmanr(steady[top50], fwd[top50]).correlation
+            top10 = set(np.argsort(-mean)[:10]); top10s = set(np.argsort(-steady)[:10])
+            fwd20 = set(np.argsort(-fwd)[:20])
+            rows.append(dict(window_h=w, at=pd.to_datetime(cube.hours[h], unit="s").strftime("%m-%d %Hh"),
+                             ic_mean=ic_mean, ic_steady=ic_steady, ic_top50=ic_top50, ic_top50_steady=ic_top50_steady,
+                             hit10_mean=len(top10 & fwd20) / 10, hit10_steady=len(top10s & fwd20) / 10))
+    df = pd.DataFrame(rows)
+    return df.groupby("window_h")[["ic_mean", "ic_steady", "ic_top50", "ic_top50_steady", "hit10_mean", "hit10_steady"]].agg(["mean", "count"]).round(3)
 
 
 if __name__ == "__main__":

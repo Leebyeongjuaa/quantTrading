@@ -221,6 +221,51 @@ class Fetcher:
             for p in coin["prices"]:
                 rows.append(dict(token=t, ts=p["timestamp"], price=p["price"], symbol=coin.get("symbol"), decimals=coin.get("decimals")))
             time.sleep(0.3)
+        df = pd.DataFrame(rows)
+        missing = [t for t in tokens if t not in set(df.token)]
+        spot = self.pool_spot_prices(missing, df)
+        if len(spot):
+            df = pd.concat([df, spot], ignore_index=True)
+        return df
+
+    def pool_spot_prices(self, missing: list[str], priced: pd.DataFrame) -> pd.DataFrame:
+        """Fallback: price a token from the current spot of an Aero pool pairing it with a priced token.
+        One constant price (stamped at launch) - acceptable for tokenized stocks / long-tail over a ~2 week window."""
+        gauges = pd.read_csv(os.path.join(DATA, "gauges.csv"))
+        last_px = priced.sort_values("ts").groupby("token").price.last().to_dict()
+        tmeta = self.token_meta(sorted(set(missing) | set(last_px)))
+        rows, w3 = [], self.w3
+        slot0_abi = [{"type": "function", "name": "slot0", "stateMutability": "view", "inputs": [], "outputs": [
+            {"type": "uint160"}, {"type": "int24"}, {"type": "uint16"}, {"type": "uint16"}, {"type": "uint16"}, {"type": "bool"}]}]
+        res_abi = [{"type": "function", "name": "getReserves", "stateMutability": "view", "inputs": [], "outputs": [
+            {"type": "uint256"}, {"type": "uint256"}, {"type": "uint256"}]}]
+        for t in missing:
+            cands = gauges[((gauges.token0.str.lower() == t.lower()) & gauges.token1.isin(last_px)) |
+                           ((gauges.token1.str.lower() == t.lower()) & gauges.token0.isin(last_px))]
+            cands = cands.sort_values("weight_now", ascending=False)
+            for pool in cands.itertuples():
+                try:
+                    is0 = pool.token0.lower() == t.lower()
+                    other = pool.token1 if is0 else pool.token0
+                    d_t, d_o = tmeta[t]["decimals"], tmeta[other]["decimals"]
+                    if pool.tick_spacing > 0:
+                        c = w3.eth.contract(address=cs(pool.pool), abi=slot0_abi)
+                        sqrt_p = self.rpc.call(lambda w3: c.functions.slot0().call())[0]
+                        p01 = (sqrt_p / 2 ** 96) ** 2  # raw token1 per raw token0
+                        px_t_in_other = (p01 if is0 else 1 / p01) * 10 ** ((d_t - d_o) if is0 else (d_t - d_o))
+                    else:
+                        c = w3.eth.contract(address=cs(pool.pool), abi=res_abi)
+                        r0, r1 = self.rpc.call(lambda w3: c.functions.getReserves().call())[:2]
+                        if r0 == 0 or r1 == 0:
+                            continue
+                        px_t_in_other = (r1 / 10 ** d_o) / (r0 / 10 ** d_t) if is0 else (r0 / 10 ** d_o) / (r1 / 10 ** d_t)
+                    px = px_t_in_other * last_px[other]
+                    if 0 < px < 1e7:  # absurd spot = empty / broken pool
+                        rows.append(dict(token=t, ts=LAUNCH_TS, price=px, symbol=tmeta[t]["symbol"], decimals=d_t, source="pool_spot"))
+                        break
+                except Exception as e:  # noqa: BLE001
+                    log.debug("spot price %s via %s failed: %s", t, pool.pool, e)
+        log.info("pool-spot priced %d of %d tokens missing from DefiLlama", len(rows), len(missing))
         return pd.DataFrame(rows)
 
 
