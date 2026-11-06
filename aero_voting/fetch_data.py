@@ -17,6 +17,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 
+import numpy as np
 import pandas as pd
 import requests
 from web3 import Web3
@@ -28,7 +29,6 @@ from .rpc import Rpc, encode_call
 log = logging.getLogger("aero.fetch")
 DATA = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
 NOTIFY_FEES_TOPIC = "0x87e2847214b11ebf92b00367c6c1a37b67c5bab8ff351feec88d712e1775de3a"
-BLOCK_SEC = 2
 # tokens DefiLlama cannot price by Base address -> proxy coin (new AERO converts 1:1 from old AERO)
 PRICE_PROXY = {
     "0x3f5bf3edac59d650d8fdf9657a71f2f904a3a4ee": "base:0x940181a94A35A4569E4529A3CDfB74e38FD98631",  # new AERO -> old AERO
@@ -51,9 +51,18 @@ class Fetcher:
         self.launch_block_ts = self.rpc.block_ts(self.launch_block)
         log.info("head=%d (%d) launch_block=%d (%d)", self.head, self.head_ts, self.launch_block, self.launch_block_ts)
 
-    def block_to_ts(self, b: int) -> int:
-        # Base has a fixed 2s block time; verified exact between launch and head.
-        return self.launch_block_ts + (b - self.launch_block) * BLOCK_SEC
+    def block_to_ts(self, b):
+        """Block -> timestamp by interpolating real block timestamps sampled every 2,000 blocks.
+        Base's block time is not constant (2s at launch, faster since early November 2026), so a fixed
+        block time misdates events."""
+        if not hasattr(self, "_ts_grid"):
+            grid = list(range(self.launch_block, self.head, 2000)) + [self.head]
+            with ThreadPoolExecutor(max_workers=4) as ex:
+                ts = list(ex.map(self.rpc.block_ts, grid))
+            self._ts_grid = (np.array(grid, dtype=float), np.array(ts, dtype=float))
+            log.info("sampled %d block timestamps for block->time interpolation", len(grid))
+        xs, ys = self._ts_grid
+        return np.rint(np.interp(np.asarray(b, dtype=float), xs, ys)).astype(np.int64)
 
     # ---------------------------------------------------------------- meta
     def fetch_meta(self) -> pd.DataFrame:
@@ -150,7 +159,7 @@ class Fetcher:
                     log.info("  %d/%d jobs, %d events", done, len(jobs), len(rows))
         df = pd.DataFrame(rows)
         df["token"] = df.token.map(cs)
-        df["ts"] = df.block.map(self.block_to_ts)
+        df["ts"] = self.block_to_ts(df.block.values)
         df = df.sort_values(["block", "log_index"]).reset_index(drop=True)
         log.info("%d fee events", len(df))
         # supply (allocation voting power) of the gauge at the release timestamp
@@ -187,6 +196,18 @@ class Fetcher:
         return df
 
     # ---------------------------------------------------------------- supply
+    def repair_fee_ts(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Recompute ts (and the supply at that ts) for every fee event from real block timestamps."""
+        new_ts = self.block_to_ts(df.block.values)
+        bad = new_ts != df.ts.values
+        log.info("repairing ts/supply for %d of %d fee events", bad.sum(), len(df))
+        df.loc[bad, "ts"] = new_ts[bad]
+        sub = df.loc[bad]
+        calls = [(r, encode_call(self.w3, REWARDS_ABI, "supplyAt", [int(t)])) for r, t in zip(sub.rewards, sub.ts)]
+        res = self.rpc.multicall(calls, [["uint256"]] * len(calls), batch=150)
+        df.loc[bad, "supply"] = [x[0] / 1e18 if x else float("nan") for x in res]
+        return df
+
     def fetch_supply_hourly(self, meta: pd.DataFrame) -> pd.DataFrame:
         hours = list(range(LAUNCH_TS, self.head_ts + 1, 3600))
         calls, keys = [], []
@@ -294,6 +315,9 @@ def main():
         else:
             df = f.fetch_fee_events(meta)
         df.to_csv(fp, index=False)
+    if st == "repair-ts":
+        fp = os.path.join(DATA, "fee_events.csv")
+        f.repair_fee_ts(pd.read_csv(fp)).to_csv(fp, index=False)
     if st in ("all", "incentives"):
         f.fetch_incentives(meta).to_csv(os.path.join(DATA, "incentives.csv"), index=False)
     if st in ("all", "supply"):

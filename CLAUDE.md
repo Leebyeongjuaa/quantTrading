@@ -28,13 +28,21 @@ quantTrading/
   release credited pro-rata to the gauge's allocation supply at that moment (`supplyAt(ts)`).
 - Incentives ("bribes") are streaming programs (`incentive(id)`: token, rate, start, end), also pro-rata.
 - Allocator earnings for amount `a` on gauge `g` over a time slice = `(fees + incentives) * a / (supply + a)`.
+- A gauge's pending fees are released by whoever touches its rewards contract (an `allocate`, a claim, or
+  `advanceGlobalPoints`), so capital newly moved into a gauge only earns from the next release. The backtest
+  models this as a 1h entry lag.
+- Base block time is **not constant**: 2s until ~2026-11-05 18:00 UTC, 0.2s after. Never convert blocks to
+  time with a fixed block time; `fetch_data.Fetcher.block_to_ts` interpolates sampled real block timestamps.
 
 ## Running
 
 ```bash
 pip install web3 pandas numpy tabulate
-python -m aero_voting.fetch_data --stage all     # ~30 min on public RPCs (publicnode: ≤10 addresses & 10k blocks per getLogs)
-python -m aero_voting.backtest --amount 100000 --window 48 --topn 5 --report reports/aero_voting_backtest.md
+pip install scipy
+python -m aero_voting.fetch_data --stage all                # full fetch, ~30 min on public RPCs (publicnode: ≤10 addresses & 10k blocks per getLogs)
+python -m aero_voting.fetch_data --stage all --incremental  # refresh: fee releases only after the last stored block
+python -m aero_voting.fetch_data --stage repair-ts          # recompute fee-event timestamps/supply from real block times
+python -m aero_voting.backtest --amount 100000 --window 168 --topn 5 --report reports/aero_voting_backtest.md
 ```
 
 ## Development Workflow
