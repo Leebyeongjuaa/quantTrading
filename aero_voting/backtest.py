@@ -196,6 +196,28 @@ def strat_blend(cube, amount, h0, h1, topn, cap):
     return w_from_scores(score, topn, cap)
 
 
+def strat_persistent(cube, amount, h0, h1, topn, cap, floor_frac=0.4, min_fee_share=0.5):
+    """Trailing version of the persistence filter: per gauge, split the window into whole days and require
+    (a) no day below floor_frac x the window's median gauge-day for the leaders (a relative floor, so it adapts
+    to the market level), (b) at least min_fee_share of earnings from fees (incentives end), then rank by the
+    median day. Falls back to fewer gauges when few pass."""
+    n_days = (h1 - h0) // 24
+    if n_days < 2:
+        return strat_blend(cube, amount, h0, h1, topn, cap)
+    hs = h1 - n_days * 24
+    with np.errstate(divide="ignore", invalid="ignore"):
+        share = amount / (cube.supply[:, hs:h1] + amount)
+    e = (cube.reward[:, hs:h1] * share).reshape(len(cube.gauges), n_days, 24).sum(axis=2)      # [g, day] USD
+    ef = (cube.fees[:, hs:h1] * share).sum(axis=1)
+    tot = e.sum(axis=1)
+    med = np.median(e, axis=1)
+    mn = e.min(axis=1)
+    fee_share = np.where(tot > 0, ef / np.where(tot > 0, tot, 1), 0)
+    ref = np.sort(med)[-topn * 4:].mean() if (med > 0).any() else 0      # typical median of the leading pack
+    ok = (mn >= floor_frac * ref) & (fee_share >= min_fee_share) & (med > 0)
+    return w_from_scores(np.where(ok, med, 0.0), topn, cap)
+
+
 def strat_market(cube, amount, h0, h1, topn, cap):
     """Allocate pro-rata to current supply = the average allocator."""
     s = cube.supply[:, h1 - 1]
@@ -213,26 +235,42 @@ STRATS = {
     "topN_mean_weighted": strat_mean_weighted,
     "steady": strat_steady,
     "blend_high_x_steady": strat_blend,
+    "persistent": strat_persistent,
     "market_avg": strat_market,
     "oracle_next_period": strat_oracle,
 }
 
 
 # ----------------------------------------------------------------------------- walk-forward
-def run(cube: Cube, amount: float, window_h: int, topn: int, cap: float, aero_px: float, start_h: int | None = None):
+def earn_lagged(cube: Cube, w: np.ndarray, prev: np.ndarray, amount: float, h0: int, h1: int) -> float:
+    """Like Cube.earn, but capital newly moved into a gauge earns nothing in the first hour: the allocate() tx
+    itself releases that gauge's pending fees to the allocators who were already there."""
+    a = amount * w
+    eff0 = amount * np.minimum(w, prev)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        first = float((cube.reward[:, h0] * np.where(eff0 > 0, eff0 / (cube.supply[:, h0] + a), 0)).sum())
+    return first + (cube.earn(w, amount, h0 + 1, h1) if h1 > h0 + 1 else 0.0)
+
+
+def run(cube: Cube, amount: float, window_h: int, topn: int, cap: float, aero_px: float, start_h: int | None = None,
+        step_h: int = STEP_H, strats: list[str] | None = None):
     n_h = len(cube.hours)
     first = start_h if start_h is not None else window_h
     out, log = {}, []
-    for name, fn in STRATS.items():
-        total, h = 0.0, first
+    G = len(cube.gauges)
+    for name in (strats or list(STRATS)):
+        fn = STRATS[name]
+        total, h, prev = 0.0, first, np.zeros(G)
         while h < n_h:
-            h_end = min(h + STEP_H, n_h)
+            h_end = min(h + step_h, n_h)
             if name == "oracle_next_period":
-                g = np.argmax([cube.earn(np.eye(len(cube.gauges))[i], amount, h, h_end) for i in range(len(cube.gauges))])
-                w = np.eye(len(cube.gauges))[g]
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    per_g = (cube.reward[:, h:h_end] * (amount / (cube.supply[:, h:h_end] + amount))).sum(axis=1)
+                w = np.eye(G)[int(np.argmax(per_g))]
             else:
                 w = fn(cube, amount, max(0, h - window_h), h, topn, cap)
-            e = cube.earn(w, amount, h, h_end)
+            e = earn_lagged(cube, w, prev, amount, h, h_end)
+            prev = w
             total += e
             picks = ", ".join(f"{cube.gauges_label[i]} {w[i]:.0%}" for i in np.argsort(-w)[:topn] if w[i] > 0)
             log.append(dict(strategy=name, hour=int(cube.hours[h]), period_h=h_end - h, usd=e, picks=picks))
@@ -314,6 +352,15 @@ def main():
         sens[f"{w}h"] = r.apr * 100
     print(pd.DataFrame(sens).T.to_string(float_format=lambda x: f"{x:,.1f}"))
 
+    print(f"\n== HYPOTHETICAL: no cooldown, re-allocate every 1h (amount={args.amount:,.0f}); APR % by look-back window ==")
+    hourly = {}
+    for w in [6, 24, 48, 96, 168]:
+        r, _ = run(cube, args.amount, w, args.topn, args.cap, aero_px, start_h=168, step_h=1,
+                   strats=[k for k in STRATS if k != "oracle_next_period"])
+        hourly[f"{w}h"] = r.apr * 100
+    hourly = pd.DataFrame(hourly).T
+    print(hourly.to_string(float_format=lambda x: f"{x:,.1f}"))
+
     print("\n== signal quality: does the trailing window predict the next 48h? (amount=%s) ==" % f"{args.amount:,.0f}")
     sig = signal_analysis(cube, args.amount)
     print(sig.to_string())
@@ -330,6 +377,8 @@ def main():
             f.write("## Top gauges\n\n" + gt[cols].head(25).to_markdown(index=False, floatfmt=",.2f") + "\n\n")
             f.write(f"## Walk-forward (amount={args.amount:,.0f}, window={args.window}h, step={STEP_H}h, topN={args.topn}, cap={args.cap:.0%})\n\n")
             f.write(res[["usd", "usd_per_day", "apr_pct", "days"]].to_markdown(floatfmt=",.2f") + "\n\n")
+            f.write(f"## Hypothetical: no cooldown, hourly re-allocation (amount={args.amount:,.0f}, from day 8, 1h entry lag)\n\n"
+                    + hourly.to_markdown(floatfmt=".1f") + "\n\n")
             f.write("## Signal quality (Spearman IC of trailing score vs next-48h realised USD; hit10 = trailing top-10 still in forward top-20)\n\n" + sig.to_markdown() + "\n\n")
             f.write("## Picks (blend_high_x_steady)\n\n" + log[log.strategy == "blend_high_x_steady"][["hour", "usd", "picks"]].assign(
                 hour=lambda d: pd.to_datetime(d.hour, unit="s")).to_markdown(index=False, floatfmt=",.0f") + "\n")

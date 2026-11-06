@@ -115,13 +115,14 @@ class Fetcher:
         return out
 
     # ---------------------------------------------------------------- fees
-    def fetch_fee_events(self, meta: pd.DataFrame) -> pd.DataFrame:
+    def fetch_fee_events(self, meta: pd.DataFrame, from_block: int | None = None) -> pd.DataFrame:
         rewards = list(meta.rewards)
         rew2gauge = dict(zip(meta.rewards.str.lower(), meta.gauge))
+        start = from_block if from_block is not None else self.launch_block
         jobs = []
         for a0 in range(0, len(rewards), 10):
             sub = rewards[a0:a0 + 10]
-            f = self.launch_block
+            f = start
             while f <= self.head:
                 t = min(f + 10_000 - 1, self.head)
                 jobs.append((sub, f, t))
@@ -272,6 +273,7 @@ class Fetcher:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--stage", default="all")
+    ap.add_argument("--incremental", action="store_true", help="fees: only fetch blocks after the last one in data/fee_events.csv")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", stream=sys.stderr)
     os.makedirs(DATA, exist_ok=True)
@@ -283,7 +285,15 @@ def main():
         meta.to_csv(mp, index=False)
     meta = pd.read_csv(mp)
     if st in ("all", "fees"):
-        f.fetch_fee_events(meta).to_csv(os.path.join(DATA, "fee_events.csv"), index=False)
+        fp = os.path.join(DATA, "fee_events.csv")
+        if args.incremental and os.path.exists(fp):
+            old = pd.read_csv(fp)
+            new = f.fetch_fee_events(meta, from_block=int(old.block.max()) + 1)
+            df = pd.concat([old, new], ignore_index=True).drop_duplicates(["tx", "log_index"])
+            log.info("appended %d new fee events (total %d)", len(new), len(df))
+        else:
+            df = f.fetch_fee_events(meta)
+        df.to_csv(fp, index=False)
     if st in ("all", "incentives"):
         f.fetch_incentives(meta).to_csv(os.path.join(DATA, "incentives.csv"), index=False)
     if st in ("all", "supply"):
