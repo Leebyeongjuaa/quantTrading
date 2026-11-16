@@ -23,6 +23,7 @@ quantTrading/
         ├── liquidator_flows.py     # Do liquidators sell seized collateral on a DEX in the same tx?
         └── backtest.py             # Short ETH/BTC just above large liquidation prices
                                     # (run: python3 backtest.py [aave] [morpho] [fluid];
+                                    #  --grid sweeps entry x stop, --exits compares exit rules;
                                     #  env: ENTRY_BUFFER, STOP, MAX_HOLD, MIN_DEBT_USD; needs eth-abi)
 ```
 
