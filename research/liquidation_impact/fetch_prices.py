@@ -1,6 +1,10 @@
-"""Per-block ETH price (open/low/high/close) from the Uniswap v3 USDC/WETH 0.05% pool.
+"""Per-block DEX prices in USD.
 
-Writes data/prices.csv covering the same block range as data/liquidations.csv.
+  python3 fetch_prices.py        ETH: open/low/high/close from the Uniswap v3 USDC/WETH 0.05%
+                                 pool -> data/prices.csv
+  python3 fetch_prices.py btc    BTC: last trade per block from the WBTC/USDC 0.05% pool and
+                                 the WBTC/WETH 0.05% pool (times the ETH price of that block)
+                                 -> data/prices_btc.csv (needs data/prices.csv)
 Blocks without a swap are omitted; forward-fill the close when a dense series is needed.
 """
 import csv
@@ -36,5 +40,28 @@ def main():
                 print(lo, file=sys.stderr, flush=True)
 
 
+V3_WBTC_USDC = "0x9a772018fbd77fcd2d25657e5c547baff3fd7d16"  # token0 WBTC (8 dec), token1 USDC (6 dec)
+V3_WBTC_WETH = "0x4585fe77225b41b697c938b018e2ac67ac5a20c0"  # token0 WBTC (8 dec), token1 WETH (18 dec)
+
+
+def btc():
+    eth = pd.read_csv("data/prices.csv", usecols=["block", "close"]).set_index("block").close
+    start, end = int(eth.index.min()), int(eth.index.max())
+    eth = eth.reindex(range(start, end + 1)).ffill()
+    ticks = {}  # (block, log_index) -> BTC price in USD
+    for pool in (V3_WBTC_USDC, V3_WBTC_WETH):
+        for lo in range(start, end + 1, 50_000):
+            for log in rpc.get_logs(pool, [V3_SWAP], lo, min(lo + 49_999, end)):
+                b = int(log["blockNumber"], 16)
+                raw = (int(log["data"][2:][128:192], 16) / 2**96) ** 2  # token1 per token0, raw units
+                price = raw * 100 if pool == V3_WBTC_USDC else raw / 1e10 * eth[b]
+                ticks[(b, int(log["logIndex"], 16))] = price
+            print(pool[:8], lo, len(ticks), file=sys.stderr, flush=True)
+    last = {}
+    for (b, _), price in sorted(ticks.items()):
+        last[b] = price
+    pd.Series(last, name="close").rename_axis("block").to_csv("data/prices_btc.csv")
+
+
 if __name__ == "__main__":
-    main()
+    btc() if sys.argv[1:] == ["btc"] else main()
