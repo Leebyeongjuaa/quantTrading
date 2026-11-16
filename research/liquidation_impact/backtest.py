@@ -13,6 +13,7 @@ Prices are end-of-block prices of the Uniswap v3 USDC/WETH 0.05% pool (data/pric
 import json
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pandas as pd
@@ -25,7 +26,8 @@ STOP = float(os.environ.get("STOP", 0.005))
 MAX_HOLD = int(os.environ.get("MAX_HOLD", 7200))
 MIN_DEBT_USD = float(os.environ.get("MIN_DEBT_USD", 2_000_000))
 REARM = 0.002  # price must first sit this far above the entry level before a (re-)entry
-PREFILTER_SLACK = 0.02  # how far above a stale estimate we start checking on-chain state
+PREFILTER_SLACK = 0.03  # daily snapshots within this distance of the level get an exact on-chain check
+INTRADAY_SLACK = 0.005  # re-check on-chain state when price is this close to the last known level
 MIN_ETH_COLLATERAL_SHARE = 0.9
 MAX_ETH_DEBT_SHARE = 0.05
 ROUND_TRIP_FEE_BPS = 10.0  # two swaps in the 0.05% pool
@@ -77,12 +79,14 @@ class LiveState:
                 self.save()
         return self.cache[key]
 
-    def _fetch(self, user, block):
+    def _calls(self, user):
         bal = bytes.fromhex("70a08231") + encode(["address"], [user])
         calls = [(POOL, account_calldata(user))]
         for asset, a_token, debt_token in self.tokens:
             calls += [(ORACLE, bytes.fromhex("b3596f07") + encode(["address"], [asset])), (a_token, bal), (debt_token, bal)]
-        out = multicall(calls, block, 0)
+        return calls
+
+    def _parse(self, out):
         if not out[0][0] or len(out[0][1]) < 192:
             return None
         coll, debt, _, _, _, hf = decode(["uint256"] * 6, out[0][1])
@@ -103,6 +107,30 @@ class LiveState:
         p_liq = eth_price * (1 - (1 - 1 / hf) / share)
         return [p_liq, debt / 1e8]
 
+    def _fetch(self, user, block):
+        return self._parse(multicall(self._calls(user), block, 0))
+
+    def prefetch(self, pairs, chunk=60):
+        """Fill the cache for many (user, block) pairs, batching users that share a block."""
+        by_block = {}
+        for user, block in pairs:
+            if f"{user}:{block}" not in self.cache:
+                by_block.setdefault(block, []).append(user)
+        tasks = [(b, us[i : i + chunk], n) for n, (b, us) in enumerate(by_block.items()) for i in range(0, len(us), chunk)]
+        per_user = 1 + 3 * len(self.tokens)
+
+        def work(task):
+            block, users, worker = task
+            out = multicall([c for u in users for c in self._calls(u)], block, worker)
+            return {f"{u}:{block}": self._parse(out[i * per_user : (i + 1) * per_user]) for i, u in enumerate(users)}
+
+        with ThreadPoolExecutor(6) as pool:
+            for n, res in enumerate(pool.map(work, tasks)):
+                self.cache.update(res)
+                if n % 100 == 0:
+                    print("prefetch", n, len(tasks), file=sys.stderr, flush=True)
+        self.save()
+
 
 def run():
     px = pd.read_csv("data/prices.csv", usecols=["block", "close"]).set_index("block").close
@@ -116,22 +144,37 @@ def run():
     snaps["p_est"] = snaps.block.map(oracle) / snaps.hf  # exact only for pure ETH-vs-USD accounts
     liq = pd.read_csv("data/liquidations.csv")
     liq_blocks = liq.groupby("user").block.apply(lambda s: np.sort(s.unique())).to_dict()
-    liq_usd = liq.groupby(["user", "block"]).size()
 
     interval = int(np.diff(np.sort(snaps.block.unique())).min())
     live = LiveState(reserve_tokens(last))
+
+    def day_segment(block):
+        b1 = min(block + interval, last - 2)
+        return b1, close[block - first + 1 : b1 - first + 1]
+
+    # exact state at the daily snapshot for every account-day that comes near its rough level
+    near = [(s.user, int(s.block)) for s in snaps.itertuples()
+            if len(day_segment(int(s.block))[1]) and day_segment(int(s.block))[1].min() <= s.p_est * (1 + ENTRY_BUFFER) * (1 + PREFILTER_SLACK)]
+    print(f"{len(near)} account-days near a rough level", file=sys.stderr)
+    live.prefetch(near)
+    near = set(near)
+
     trades = []
     users = snaps.user.unique()
-    for ui, user in enumerate(users):
+    for ui, (user, rows) in enumerate(snaps.sort_values("block").groupby("user", sort=False)):
         armed, open_until = False, -1
-        for _, s in snaps[snaps.user == user].sort_values("block").iterrows():
-            b0, b1 = int(s.block), min(int(s.block) + interval, last - 2)
-            if b1 <= b0:
-                continue
-            seg = close[b0 - first + 1 : b1 - first + 1]
-            p_est, slack = s.p_est, PREFILTER_SLACK
-            if seg.min() > p_est * (1 + ENTRY_BUFFER) * (1 + slack):
+        for s in rows.itertuples():
+            b0 = int(s.block)
+            b1, seg = day_segment(b0)
+            if (user, b0) not in near:
                 armed = True  # price stayed clear of the level all day
+                continue
+            state = live.get(user, b0)
+            if state is None or state[1] < MIN_DEBT_USD:
+                continue  # not an ETH-collateral / USD-debt position
+            p_est, slack = state[0], INTRADAY_SLACK
+            if seg.min() > p_est * (1 + ENTRY_BUFFER) * (1 + slack):
+                armed = True
                 continue
             t = b0 + 1
             while t <= b1:
