@@ -48,7 +48,7 @@ MIN_COLLATERAL_SHARE = 0.9
 MAX_SAME_ASSET_DEBT_SHARE = 0.05
 ROUND_TRIP_FEE_BPS = 10.0  # two swaps in a 0.05% pool
 DAY = 7200
-CACHE_PATH = "data/live_cache.json"
+CACHE_PATH = os.environ.get("CACHE_PATH", "data/live_cache.json")
 
 AAVE_ASSETS = {
     "ETH": [
@@ -409,8 +409,11 @@ def report(tr):
                                                net_bps=("net_bps", "mean")).round(1).to_string())
 
 
-GRID_ENTRY = [0.0005, 0.001, 0.002, 0.003, 0.005, 0.01]
-GRID_STOP = [0.003, 0.005, 0.0075, 0.01, 0.02]
+# Entry buffer may be zero or negative: enter once the DEX price is at / below the liquidation price
+# while the oracle has not caught up yet (e.g. GRID_ENTRY=0,-0.001,-0.002).
+GRID_ENTRY = [float(x) for x in os.environ.get("GRID_ENTRY", "0.0005,0.001,0.002,0.003,0.005,0.01").split(",")]
+GRID_STOP = [float(x) for x in os.environ.get("GRID_STOP", "0.003,0.005,0.0075,0.01,0.02").split(",")]
+GRID_OUT = os.environ.get("GRID_OUT", "data/grid_trades.csv")
 
 
 def grid(source_names):
@@ -422,7 +425,7 @@ def grid(source_names):
             ENTRY_BUFFER, STOP = entry, stop
             parts.append(run(source_names).assign(entry_buffer=entry, stop=stop))
             print(f"grid: entry {entry:.2%} stop {stop:.2%} -> {len(parts[-1])} trades", file=sys.stderr, flush=True)
-            pd.concat(parts).to_csv("data/grid_trades.csv", index=False)
+            pd.concat(parts).to_csv(GRID_OUT, index=False)
 
 
 def grid_report(tr, label):
@@ -526,7 +529,7 @@ if __name__ == "__main__":
 
                 SOURCES["fluid"] = Fluid
             grid(names)
-        g = pd.read_csv("data/grid_trades.csv")
+        g = pd.read_csv(GRID_OUT)
         grid_report(g, "all protocols, ETH + BTC")
         grid_report(g[(g.source == "aave") & (g.cls == "ETH")], "Aave, ETH collateral only")
         grid_report(g[g.debt_usd >= 5e6], "positions with >= $5M debt")
