@@ -9,12 +9,18 @@ Rule (all decisions use information available at that block):
   * Exit:   (a) the position is liquidated           -> cover one block after the liquidation
             (b) price closes STOP above the entry    -> cover one block later
             (c) MAX_HOLD blocks pass                 -> cover
+          optional:
+            (d) TAKE_PROFIT: price closes that far below the entry -> cover one block later
+            (e) DEFEND_EXIT: the borrower adds margin / repays so that P_liq drops by more than
+                that fraction (or the position stops qualifying)   -> cover one block later
 Prices: data/prices.csv (ETH) and data/prices_btc.csv (BTC), last Uniswap v3 trade per block.
 
   python3 backtest.py [aave] [morpho] [fluid]     run the listed sources (default: all)
   python3 backtest.py --report-only               re-print the report from data/trades.csv
   python3 backtest.py --grid                      sweep entry buffer x stop (GRID_ENTRY, GRID_STOP)
   python3 backtest.py --grid-report               re-print the sweep from data/grid_trades.csv
+  python3 backtest.py --exits                     compare exit rules (take-profit, margin-add exit)
+  python3 backtest.py --exits-report              re-print that comparison from data/exit_trades.csv
 """
 import json
 import os
@@ -31,6 +37,8 @@ from snapshots import ORACLE, POOL, WETH, account_calldata, multicall
 ENTRY_BUFFER = float(os.environ.get("ENTRY_BUFFER", 0.003))
 STOP = float(os.environ.get("STOP", 0.005))
 MAX_HOLD = int(os.environ.get("MAX_HOLD", 7200))
+TAKE_PROFIT = float(os.environ.get("TAKE_PROFIT", 0))  # 0 = off
+DEFEND_EXIT = float(os.environ.get("DEFEND_EXIT", 0))  # 0 = off
 MIN_DEBT_USD = float(os.environ.get("MIN_DEBT_USD", 2_000_000))
 SIGNAL_MEDIAN_BLOCKS = 3
 REARM = 0.002  # price must first sit this far above the entry level before a (re-)entry
@@ -222,11 +230,25 @@ def load_prices():
     return first, last, out
 
 
+_ctx = {}
+
+
+def context(source_names):
+    """Prices, cache and sources, loaded once per process."""
+    if not _ctx:
+        _ctx.update(prices=load_prices(), cache=Cache(), sources={}, day_min={})
+    for n in source_names:
+        if n not in _ctx["sources"]:
+            _ctx["sources"][n] = SOURCES[n](_ctx["cache"], _ctx["prices"][1])
+    return _ctx
+
+
 def run(source_names):
-    first, last, prices = load_prices()
-    cache = Cache()
+    ctx = context(source_names)
+    first, last, prices = ctx["prices"]
+    cache = ctx["cache"]
     trades = []
-    for source in [SOURCES[n](cache, last) for n in source_names]:
+    for source in [ctx["sources"][n] for n in source_names]:
         daily = source.daily[source.daily.block >= first]
         slack0 = INTRADAY_SLACK if source.exact_daily else ROUGH_SLACK
 
@@ -234,8 +256,10 @@ def run(source_names):
             return min(block + DAY, last - 2)
 
         def day_min(cls, block):
-            seg = prices[cls][0][block - first + 1 : day_end(block) - first + 1]
-            return seg.min() if len(seg) else np.inf
+            if (cls, block) not in ctx["day_min"]:
+                seg = prices[cls][0][block - first + 1 : day_end(block) - first + 1]
+                ctx["day_min"][(cls, block)] = seg.min() if len(seg) else np.inf
+            return ctx["day_min"][(cls, block)]
 
         near = {(r.pos, r.cls, int(r.block)) for r in daily.itertuples()
                 if day_min(r.cls, int(r.block)) <= r.p_est * (1 + ENTRY_BUFFER) * (1 + slack0)}
@@ -305,16 +329,34 @@ def simulate(source, pos, cls, t, p_liq, debt, at, fill_at, last):
         return None
     entry = fill_at(t + 1)
     end = min(t + 1 + MAX_HOLD, last - 1)
-    stop_block = next((b for b in range(t + 2, end + 1) if at(b) >= entry * (1 + STOP)), None)
-    liq_block = source.liquidation(pos, t, stop_block or end)
+    reason, sig = "timeout", end
+    for b in range(t + 2, end + 1):
+        price = at(b)
+        if price >= entry * (1 + STOP):
+            reason, sig = "stop", b
+            break
+        if TAKE_PROFIT and price <= entry * (1 - TAKE_PROFIT):
+            reason, sig = "take_profit", b
+            break
+    liq_block = source.liquidation(pos, t, sig)
     if liq_block is not None and liq_block <= t + 1:
         return None  # liquidated before we could get in
     if liq_block is not None:
         reason, sig = "liquidated", liq_block
-    elif stop_block:
-        reason, sig = "stop", stop_block
-    else:
-        reason, sig = "timeout", end
+    if DEFEND_EXIT:
+        # Did the borrower pull the liquidation price away before our exit? Look at the state just
+        # before the exit, then bisect for the first block where it had moved.
+        def defended(block):
+            state = source.live(pos, cls, block)
+            return state is None or state[0] < p_liq * (1 - DEFEND_EXIT)
+
+        check = sig - 1 if reason == "liquidated" else sig
+        if check > t + 1 and defended(check):
+            lo, hi = t + 1, check
+            while lo < hi:
+                mid = (lo + hi) // 2
+                lo, hi = (lo, mid) if defended(mid) else (mid + 1, hi)
+            reason, sig = "defended", lo
     exit_price = fill_at(sig + 1)
     return {
         "source": source.name, "cls": cls, "pos": pos, "debt_usd": debt, "p_liq": p_liq, "signal_block": t,
@@ -413,9 +455,70 @@ def grid_report(tr, label):
         print(cells.pivot(index="entry%", columns="stop%", values=metric).round(1).to_string())
 
 
+EXIT_VARIANTS = [  # (label, take profit, margin-add exit threshold)
+    ("base", 0, 0),
+    ("defend", 0, 0.003),
+    ("tp 0.5%", 0.005, 0),
+    ("tp 1%", 0.01, 0),
+    ("tp 2%", 0.02, 0),
+    ("tp 1% + defend", 0.01, 0.003),
+    ("tp 2% + defend", 0.02, 0.003),
+]
+EXIT_CELLS = [(e, s) for e in (0.001, 0.002, 0.003) for s in (0.005, 0.0075, 0.01)]
+
+
+def exits(source_names):
+    """Run each exit variant on the nine entry/stop sets of the robust region."""
+    global ENTRY_BUFFER, STOP, TAKE_PROFIT, DEFEND_EXIT
+    parts = []
+    for label, TAKE_PROFIT, DEFEND_EXIT in EXIT_VARIANTS:
+        for ENTRY_BUFFER, STOP in EXIT_CELLS:
+            parts.append(run(source_names).assign(variant=label, entry_buffer=ENTRY_BUFFER, stop=STOP))
+            print(f"exits: {label} entry {ENTRY_BUFFER:.2%} stop {STOP:.2%} -> {len(parts[-1])} trades",
+                  file=sys.stderr, flush=True)
+            pd.concat(parts).to_csv("data/exit_trades.csv", index=False)
+
+
+def exits_report(tr, label):
+    first, last, _ = load_prices()
+    days = (last - first) * 12 / 86400
+    tr = tr.assign(net_bps=tr.gross_bps - ROUND_TRIP_FEE_BPS)
+    rows = []
+    for (variant, entry, stop), d in tr.groupby(["variant", "entry_buffer", "stop"], sort=False):
+        one = one_at_a_time(d)
+        by_day = one.groupby(one.signal_block // DAY).net_bps.sum()
+        eq = one.net_bps.cumsum() / 100
+        counts = one.reason.value_counts()
+        rows.append({"variant": variant, "cell": f"{entry * 100:g}/{stop * 100:g}", "trades": len(one),
+                     "APR": one.net_bps.sum() / 100 * 365 / days,
+                     "APR ex best day": (one.net_bps.sum() - by_day.max()) / 100 * 365 / days,
+                     "max drawdown": (eq.cummax().clip(lower=0) - eq).max(),
+                     "net bps": one.net_bps.mean(),
+                     **{f"n {r}": counts.get(r, 0) for r in ("liquidated", "stop", "take_profit", "defended")},
+                     **{f"bps {r}": one[one.reason == r].net_bps.mean() for r in ("take_profit", "defended")}})
+    rows = pd.DataFrame(rows)
+    order = [v[0] for v in EXIT_VARIANTS]
+    print(f"===== {label}: one position at a time, {days:.0f} days =====")
+    print("\nAPR % by entry/stop set (columns) and exit rule (rows)")
+    print(rows.pivot(index="variant", columns="cell", values="APR").reindex(order).round(1).to_string())
+    print("\naverage over the nine sets")
+    print(rows.drop(columns="cell").groupby("variant").mean().reindex(order).round(1).to_string())
+
+
 if __name__ == "__main__":
     out = os.environ.get("OUT", "data/trades.csv")
     names = [a for a in sys.argv[1:] if not a.startswith("--")] or ["aave", "morpho", "fluid"]
+    if "--exits" in sys.argv or "--exits-report" in sys.argv:
+        if "--exits" in sys.argv:
+            if "fluid" in names:
+                from fluid import Fluid
+
+                SOURCES["fluid"] = Fluid
+            exits(names)
+        x = pd.read_csv("data/exit_trades.csv")
+        exits_report(x, "all protocols, ETH + BTC")
+        exits_report(x[(x.source == "aave") & (x.cls == "ETH")], "Aave, ETH collateral only")
+        sys.exit()
     if "--grid" in sys.argv or "--grid-report" in sys.argv:
         if "--grid" in sys.argv:
             if "fluid" in names:
