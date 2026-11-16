@@ -21,7 +21,6 @@ from eth_abi import decode, encode
 import rpc
 from snapshots import ORACLE, WETH, multicall
 
-VAULT_RESOLVER = "0x6943ed9e53e3713bf24a92016984254311772f1a"
 POSITIONS_RESOLVER = "0xaa21a86030eaa16546a759d2d10fd3bf9d053bc7"
 LOG_OPERATE = "0xfef64760e30a41b9d5ba7dd65ff7236a61d89ed8b44c67a29e84db1a67513a1c"
 LOG_LIQUIDATE = "0x80fd9cc6b1821f4a510e45ffce6852ea3404807b5d3d833ffa85664408afcb66"
@@ -48,28 +47,31 @@ def signed(word):
 
 
 def vault_calls(vault, nft_ids):
-    """Threshold word, collateral ratio prices and the positions of `nft_ids` in one vault."""
+    """Threshold word, collateral ratio prices, then one call per position (a batched position
+    query reverts as a whole when any of its NFTs does not exist yet at that block)."""
     priced_via = VAULTS[vault][3] or WETH
     return [
-        (VAULT_RESOLVER, bytes.fromhex("eb1db018") + encode(["address"], [vault])),  # getVaultVariables2Raw
+        (vault, bytes.fromhex("b5c736e4") + (1).to_bytes(32, "big")),  # readFromStorage(vaultVariables2)
         (ORACLE, bytes.fromhex("b3596f07") + encode(["address"], [priced_via])),
         (ORACLE, bytes.fromhex("b3596f07") + encode(["address"], [WETH])),
-        (POSITIONS_RESOLVER, bytes.fromhex("6970693c") + encode(["uint256[]", "address"], [nft_ids, vault])),
-    ]
+    ] + [(POSITIONS_RESOLVER, bytes.fromhex("6970693c") + encode(["uint256[]", "address"], [[n], vault])) for n in nft_ids]
 
 
 def value_positions(vault, out):
     """-> {nftId: (p_liq of the base asset, debt_usd, collateral units)} from vault_calls results."""
-    if not all(ok and ret for ok, ret in out):
+    if not all(ok and ret for ok, ret in out[:3]):
         return {}
     cls, col_dec, debt_dec, priced_via = VAULTS[vault]
     threshold = ((int.from_bytes(out[0][1], "big") >> 42) & 1023) / 1000
     ratio = int.from_bytes(out[1][1], "big") / int.from_bytes(out[2][1], "big") if priced_via else 1.0
     res = {}
-    for nft, _, supply, borrow in decode(["(uint256,address,uint256,uint256)[]"], out[3][1])[0]:
-        if supply and borrow and threshold:
-            collateral, debt = supply / 10**col_dec, borrow / 10**debt_dec
-            res[nft] = (debt / (collateral * threshold * ratio), debt, collateral)
+    for ok, ret in out[3:]:
+        if not ok or not ret:
+            continue
+        for nft, _, supply, borrow in decode(["(uint256,address,uint256,uint256)[]"], ret)[0]:
+            if supply and borrow and threshold:
+                collateral, debt = supply / 10**col_dec, borrow / 10**debt_dec
+                res[nft] = (debt / (collateral * threshold * ratio), debt, collateral)
     return res
 
 

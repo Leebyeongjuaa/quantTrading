@@ -15,11 +15,15 @@ quantTrading/
         ├── fetch_liquidations.py   # Aave v3 LiquidationCall events -> data/liquidations.csv
         ├── fetch_swaps.py          # Uniswap ETH/USDC swap ticks -> data/swaps.csv
         ├── analyze.py              # Event study (run: python3 analyze.py [v3|v4])
-        ├── fetch_prices.py         # Per-block ETH price from the Uniswap pool -> data/prices.csv
+        ├── fetch_prices.py         # Per-block ETH (and `btc`) price from Uniswap pools -> data/prices*.csv
         ├── fetch_borrowers.py      # Large stablecoin borrowers on Aave v3 -> data/borrowers.csv
-        ├── snapshots.py            # Daily historical health factors -> data/snapshots.csv
-        └── backtest.py             # Short ETH just above large liquidation prices
-                                    # (env: ENTRY_BUFFER, STOP, MAX_HOLD, MIN_DEBT_USD; needs eth-abi)
+        ├── snapshots.py            # Aave: daily historical health factors -> data/snapshots.csv
+        ├── morpho.py               # Morpho Blue: markets, liquidations, daily positions
+        ├── fluid.py                # Fluid vaults: liquidations, daily positions
+        ├── liquidator_flows.py     # Do liquidators sell seized collateral on a DEX in the same tx?
+        └── backtest.py             # Short ETH/BTC just above large liquidation prices
+                                    # (run: python3 backtest.py [aave] [morpho] [fluid];
+                                    #  env: ENTRY_BUFFER, STOP, MAX_HOLD, MIN_DEBT_USD; needs eth-abi)
 ```
 
 > **Note:** This file should be updated as modules, services, and tooling are added.
