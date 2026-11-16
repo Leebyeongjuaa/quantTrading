@@ -13,6 +13,8 @@ Prices: data/prices.csv (ETH) and data/prices_btc.csv (BTC), last Uniswap v3 tra
 
   python3 backtest.py [aave] [morpho] [fluid]     run the listed sources (default: all)
   python3 backtest.py --report-only               re-print the report from data/trades.csv
+  python3 backtest.py --grid                      sweep entry buffer x stop (GRID_ENTRY, GRID_STOP)
+  python3 backtest.py --grid-report               re-print the sweep from data/grid_trades.csv
 """
 import json
 import os
@@ -365,9 +367,67 @@ def report(tr):
                                                net_bps=("net_bps", "mean")).round(1).to_string())
 
 
+GRID_ENTRY = [0.0005, 0.001, 0.002, 0.003, 0.005, 0.01]
+GRID_STOP = [0.003, 0.005, 0.0075, 0.01, 0.02]
+
+
+def grid(source_names):
+    """Run every (entry buffer, stop) combination and save all trades to data/grid_trades.csv."""
+    global ENTRY_BUFFER, STOP
+    parts = []
+    for entry in GRID_ENTRY:
+        for stop in GRID_STOP:
+            ENTRY_BUFFER, STOP = entry, stop
+            parts.append(run(source_names).assign(entry_buffer=entry, stop=stop))
+            print(f"grid: entry {entry:.2%} stop {stop:.2%} -> {len(parts[-1])} trades", file=sys.stderr, flush=True)
+            pd.concat(parts).to_csv("data/grid_trades.csv", index=False)
+
+
+def grid_report(tr, label):
+    """One table per metric, rows = entry buffer, columns = stop. APR is one position at a time."""
+    first, last, _ = load_prices()
+    days = (last - first) * 12 / 86400
+    middle = (first + last) // 2
+    tr = tr.assign(net_bps=tr.gross_bps - ROUND_TRIP_FEE_BPS)
+    cells = []
+    for (entry, stop), d in tr.groupby(["entry_buffer", "stop"]):
+        one = one_at_a_time(d)
+        by_day = one.groupby(one.signal_block // DAY).net_bps.sum()
+        x = one.net_bps
+        cells.append({
+            "entry%": entry * 100, "stop%": stop * 100,
+            "trades": len(one),
+            "liquidated %": 100 * (one.reason == "liquidated").mean(),
+            "net bps / trade": x.mean(),
+            "t-stat": x.mean() / (x.std(ddof=1) / np.sqrt(len(x))),
+            "APR %": x.sum() / 100 * 365 / days,
+            "APR % without best day": (x.sum() - by_day.max()) / 100 * 365 / days,
+            "APR % first half": one[one.signal_block < middle].net_bps.sum() / 100 * 365 / (days / 2),
+            "APR % second half": one[one.signal_block >= middle].net_bps.sum() / 100 * 365 / (days / 2),
+            "winning days %": 100 * (by_day > 0).mean(),
+        })
+    cells = pd.DataFrame(cells)
+    print(f"===== {label}: {tr.groupby(['entry_buffer', 'stop']).ngroups} parameter sets =====")
+    for metric in cells.columns[2:]:
+        print(f"\n{metric}  (rows: entry buffer %, columns: stop %)")
+        print(cells.pivot(index="entry%", columns="stop%", values=metric).round(1).to_string())
+
+
 if __name__ == "__main__":
     out = os.environ.get("OUT", "data/trades.csv")
     names = [a for a in sys.argv[1:] if not a.startswith("--")] or ["aave", "morpho", "fluid"]
+    if "--grid" in sys.argv or "--grid-report" in sys.argv:
+        if "--grid" in sys.argv:
+            if "fluid" in names:
+                from fluid import Fluid
+
+                SOURCES["fluid"] = Fluid
+            grid(names)
+        g = pd.read_csv("data/grid_trades.csv")
+        grid_report(g, "all protocols, ETH + BTC")
+        grid_report(g[(g.source == "aave") & (g.cls == "ETH")], "Aave, ETH collateral only")
+        grid_report(g[g.debt_usd >= 5e6], "positions with >= $5M debt")
+        sys.exit()
     if "--report-only" in sys.argv:
         trades = pd.read_csv(out)
     else:
