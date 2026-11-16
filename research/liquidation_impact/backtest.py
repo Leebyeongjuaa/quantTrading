@@ -1,14 +1,18 @@
-"""Backtest: short ETH just above a large Aave position's liquidation price.
+"""Backtest: short ETH/BTC just above a large lending position's liquidation price.
 
 Rule (all decisions use information available at that block):
-  * Universe: Aave v3 accounts with >= MIN_DEBT_USD of debt whose collateral is ETH-like
-    and whose debt is not, so their health factor moves one-for-one with the ETH price.
-  * Liquidation price P_liq = ETH price at which the health factor reaches 1.
+  * Universe: positions with >= MIN_DEBT_USD of USD-stablecoin debt against ETH-like or BTC-like
+    collateral on Aave v3, Morpho Blue and Fluid (Ethereum mainnet), so their health factor
+    moves one-for-one with the ETH (or BTC) price.
+  * Liquidation price P_liq = price at which the health factor reaches 1.
   * Entry:  DEX price closes within ENTRY_BUFFER above P_liq -> short, filled one block later.
-  * Exit:   (a) the account is liquidated            -> cover one block after the liquidation
+  * Exit:   (a) the position is liquidated           -> cover one block after the liquidation
             (b) price closes STOP above the entry    -> cover one block later
             (c) MAX_HOLD blocks pass                 -> cover
-Prices are end-of-block prices of the Uniswap v3 USDC/WETH 0.05% pool (data/prices.csv).
+Prices: data/prices.csv (ETH) and data/prices_btc.csv (BTC), last Uniswap v3 trade per block.
+
+  python3 backtest.py [aave] [morpho] [fluid]     run the listed sources (default: all)
+  python3 backtest.py --report-only               re-print the report from data/trades.csv
 """
 import json
 import os
@@ -19,6 +23,7 @@ import numpy as np
 import pandas as pd
 from eth_abi import decode, encode
 
+import morpho
 from snapshots import ORACLE, POOL, WETH, account_calldata, multicall
 
 ENTRY_BUFFER = float(os.environ.get("ENTRY_BUFFER", 0.003))
@@ -27,276 +32,349 @@ MAX_HOLD = int(os.environ.get("MAX_HOLD", 7200))
 MIN_DEBT_USD = float(os.environ.get("MIN_DEBT_USD", 2_000_000))
 SIGNAL_MEDIAN_BLOCKS = 3
 REARM = 0.002  # price must first sit this far above the entry level before a (re-)entry
-PREFILTER_SLACK = 0.03  # daily snapshots within this distance of the level get an exact on-chain check
+ROUGH_SLACK = 0.03  # Aave daily estimates assume pure collateral; check on-chain when this close
 INTRADAY_SLACK = 0.005  # re-check on-chain state when price is this close to the last known level
-MIN_ETH_COLLATERAL_SHARE = 0.9
-MAX_ETH_DEBT_SHARE = 0.05
-ROUND_TRIP_FEE_BPS = 10.0  # two swaps in the 0.05% pool
-
-ETH_LIKE = [
-    WETH,
-    "0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0",  # wstETH
-    "0xcd5fe23c85820f7b72d0926fc9b05b43e359b7ee",  # weETH
-    "0xae78736cd615f374d3085123a210448e74fc6393",  # rETH
-    "0xbe9895146f7af43049ca1c1ae358b0541ea49704",  # cbETH
-    "0xf1c9acdc66974dfb6decb12aa385b9cd01190e38",  # osETH
-    "0xa1290d69c65a6fe4df752f95823fae25cb99e5a7",  # rsETH
-    "0xa35b1b31ce002fbf2058d22f30f95d405200a15b",  # ETHx
-    "0xbf5495efe5db9ce00f80364c8b423567e58d2110",  # ezETH
-]
+MIN_COLLATERAL_SHARE = 0.9
+MAX_SAME_ASSET_DEBT_SHARE = 0.05
+ROUND_TRIP_FEE_BPS = 10.0  # two swaps in a 0.05% pool
+DAY = 7200
 CACHE_PATH = "data/live_cache.json"
 
+AAVE_ASSETS = {
+    "ETH": [
+        WETH,
+        "0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0",  # wstETH
+        "0xcd5fe23c85820f7b72d0926fc9b05b43e359b7ee",  # weETH
+        "0xae78736cd615f374d3085123a210448e74fc6393",  # rETH
+        "0xbe9895146f7af43049ca1c1ae358b0541ea49704",  # cbETH
+        "0xf1c9acdc66974dfb6decb12aa385b9cd01190e38",  # osETH
+        "0xa1290d69c65a6fe4df752f95823fae25cb99e5a7",  # rsETH
+        "0xa35b1b31ce002fbf2058d22f30f95d405200a15b",  # ETHx
+        "0xbf5495efe5db9ce00f80364c8b423567e58d2110",  # ezETH
+    ],
+    "BTC": [
+        morpho.WBTC,
+        "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf",  # cbBTC
+        "0x18084fba666a33d37592fa2633fd49a74dd93a88",  # tBTC
+        "0x8236a87084f8b84306f72007f36f2618a5634494",  # LBTC
+        "0x657e8c867d8b37dcc18fa4caead9c45eb088c642",  # eBTC
+        "0xc96de26018a54d51c097160568752c4e3bd6c364",  # FBTC
+    ],
+}
 
-def reserve_tokens(block):
-    """(aToken, variableDebtToken) for each listed ETH-like reserve."""
-    calls = [(POOL, bytes.fromhex("35ea6a75") + encode(["address"], [a])) for a in ETH_LIKE]  # getReserveData
-    out = []
-    for asset, (ok, ret) in zip(ETH_LIKE, multicall(calls, block, 0)):
-        a_token = "0x" + ret[8 * 32 + 12 : 9 * 32].hex()
-        debt_token = "0x" + ret[10 * 32 + 12 : 11 * 32].hex()
-        if ok and int(a_token, 16):
-            out.append((asset, a_token, debt_token))
-    return out
 
+class Cache:
+    """Disk cache for on-chain lookups at historical blocks."""
 
-class LiveState:
-    """On-chain account state at an arbitrary historical block, cached on disk."""
+    def __init__(self):
+        self.data = json.load(open(CACHE_PATH)) if os.path.exists(CACHE_PATH) else {}
+        self.misses = 0
 
-    def __init__(self, tokens):
-        self.tokens = tokens
-        self.cache = json.load(open(CACHE_PATH)) if os.path.exists(CACHE_PATH) else {}
-        self.calls = 0
+    def get(self, key, fetch):
+        if key not in self.data:
+            self.data[key] = fetch()
+            self.misses += 1
+            if self.misses % 200 == 0:
+                self.save()
+        return self.data[key]
 
     def save(self):
-        json.dump(self.cache, open(CACHE_PATH, "w"))
+        json.dump(self.data, open(CACHE_PATH, "w"))
 
-    def get(self, user, block):
-        """Returns (liquidation price of ETH, debt in USD) or None if not an ETH-vs-USD position."""
-        key = f"{user}:{block}"
-        if key not in self.cache:
-            self.cache[key] = self._fetch(user, block)
-            self.calls += 1
-            if self.calls % 200 == 0:
-                self.save()
-        return self.cache[key]
+
+class Aave:
+    """pos = account address. An account qualifies for a class (ETH or BTC) when >= 90% of its
+    collateral and <= 5% of its debt is in that class."""
+
+    name = "aave"
+    exact_daily = False
+
+    def __init__(self, cache, last_block):
+        self.cache = cache
+        oracle = pd.read_csv("data/oracle_base.csv").set_index("block")
+        snaps = pd.read_csv("data/snapshots.csv")
+        snaps = snaps[snaps.debt_usd >= MIN_DEBT_USD].rename(columns={"user": "pos"})
+        self.daily = pd.concat(
+            [snaps.assign(cls=c, p_est=snaps.block.map(oracle[c]) / snaps.hf) for c in ("ETH", "BTC")]
+        )[["block", "pos", "cls", "debt_usd", "p_est"]]
+        liq = pd.read_csv("data/liquidations.csv")
+        self.liq_blocks = liq.groupby("user").block.apply(lambda s: np.sort(s.unique())).to_dict()
+        self.tokens = self._reserve_tokens(last_block)
+        self.per_user = 1 + 3 * len(self.tokens)
+
+    def _reserve_tokens(self, block):
+        assets = [(c, a) for c, lst in AAVE_ASSETS.items() for a in lst]
+        calls = [(POOL, bytes.fromhex("35ea6a75") + encode(["address"], [a])) for _, a in assets]  # getReserveData
+        out = []
+        for (cls, asset), (ok, ret) in zip(assets, multicall(calls, block, 0)):
+            a_token, debt_token = "0x" + ret[8 * 32 + 12 : 9 * 32].hex(), "0x" + ret[10 * 32 + 12 : 11 * 32].hex()
+            if ok and int(a_token, 16):
+                out.append((cls, asset, a_token, debt_token))
+        return out
 
     def _calls(self, user):
         bal = bytes.fromhex("70a08231") + encode(["address"], [user])
         calls = [(POOL, account_calldata(user))]
-        for asset, a_token, debt_token in self.tokens:
+        for _, asset, a_token, debt_token in self.tokens:
             calls += [(ORACLE, bytes.fromhex("b3596f07") + encode(["address"], [asset])), (a_token, bal), (debt_token, bal)]
         return calls
 
     def _parse(self, out):
+        """-> {cls: [p_liq, debt_usd] or None}"""
+        res = {"ETH": None, "BTC": None}
         if not out[0][0] or len(out[0][1]) < 192:
-            return None
+            return res
         coll, debt, _, _, _, hf = decode(["uint256"] * 6, out[0][1])
         if debt == 0 or coll == 0:
-            return None
+            return res
         word = lambda i: int.from_bytes(out[i][1], "big") if out[i][0] and out[i][1] else 0
-        eth_coll = eth_debt = 0.0
-        for n in range(len(self.tokens)):
+        held, owed, base = {"ETH": 0.0, "BTC": 0.0}, {"ETH": 0.0, "BTC": 0.0}, {}
+        for n, (cls, asset, _, _) in enumerate(self.tokens):
             price = word(1 + 3 * n)
-            eth_coll += word(2 + 3 * n) / 1e18 * price
-            eth_debt += word(3 + 3 * n) / 1e18 * price
-        share = min(1.0, eth_coll / coll)
-        if share < MIN_ETH_COLLATERAL_SHARE or eth_debt / debt > MAX_ETH_DEBT_SHARE:
-            return None
-        eth_price = word(1) / 1e8  # Aave oracle price of WETH
-        hf = hf / 1e18
-        # health factor scales with the ETH price on the ETH share of collateral
-        p_liq = eth_price * (1 - (1 - 1 / hf) / share)
-        return [p_liq, debt / 1e8]
+            if asset in (WETH, morpho.WBTC):
+                base[cls] = price / 1e8
+            decimals = 8 if cls == "BTC" and asset != "0x18084fba666a33d37592fa2633fd49a74dd93a88" else 18
+            held[cls] += word(2 + 3 * n) / 10**decimals * price
+            owed[cls] += word(3 + 3 * n) / 10**decimals * price
+        for cls in res:
+            share = min(1.0, held[cls] / coll)
+            if share >= MIN_COLLATERAL_SHARE and owed[cls] / debt <= MAX_SAME_ASSET_DEBT_SHARE:
+                # health factor scales with the asset price on that share of the collateral
+                res[cls] = [base[cls] * (1 - (1 - 1e18 / hf) / share), debt / 1e8]
+        return res
 
-    def _fetch(self, user, block):
-        return self._parse(multicall(self._calls(user), block, 0))
-
-    def prefetch(self, pairs, chunk=60):
-        """Fill the cache for many (user, block) pairs, batching users that share a block."""
+    def prefetch(self, keys):
+        """keys: (pos, cls, block). Batches accounts that share a block."""
         by_block = {}
-        for user, block in pairs:
-            if f"{user}:{block}" not in self.cache:
-                by_block.setdefault(block, []).append(user)
-        tasks = [(b, us[i : i + chunk], n) for n, (b, us) in enumerate(by_block.items()) for i in range(0, len(us), chunk)]
-        per_user = 1 + 3 * len(self.tokens)
+        for user, block in {(u, b) for u, c, b in keys if f"aave:{u}:{c}:{b}" not in self.cache.data}:
+            by_block.setdefault(block, []).append(user)
+        tasks = [(b, us[i : i + 40], n) for n, (b, us) in enumerate(by_block.items()) for i in range(0, len(us), 40)]
 
         def work(task):
             block, users, worker = task
             out = multicall([c for u in users for c in self._calls(u)], block, worker)
-            return {f"{u}:{block}": self._parse(out[i * per_user : (i + 1) * per_user]) for i, u in enumerate(users)}
+            res = {}
+            for i, u in enumerate(users):
+                for cls, v in self._parse(out[i * self.per_user : (i + 1) * self.per_user]).items():
+                    res[f"aave:{u}:{cls}:{block}"] = v
+            return res
 
         with ThreadPoolExecutor(6) as pool:
             for n, res in enumerate(pool.map(work, tasks)):
-                self.cache.update(res)
+                self.cache.data.update(res)
                 if n % 100 == 0:
-                    print("prefetch", n, len(tasks), file=sys.stderr, flush=True)
-        self.save()
+                    print("aave prefetch", n, len(tasks), file=sys.stderr, flush=True)
+        self.cache.save()
+
+    def live(self, pos, cls, block):
+        def fetch():
+            res = self._parse(multicall(self._calls(pos), block, 0))
+            for c, v in res.items():
+                self.cache.data[f"aave:{pos}:{c}:{block}"] = v
+            return res[cls]
+
+        return self.cache.get(f"aave:{pos}:{cls}:{block}", fetch)
+
+    def liquidation(self, pos, after, until):
+        blocks = self.liq_blocks.get(pos, [])
+        i = np.searchsorted(blocks, after, side="right")
+        return int(blocks[i]) if i < len(blocks) and blocks[i] <= until else None
 
 
-def run():
-    px = pd.read_csv("data/prices.csv", usecols=["block", "close"]).set_index("block").close
-    first, last = int(px.index.min()), int(px.index.max())
-    dense = px.reindex(range(first, last + 1)).ffill()
-    fill = dense.to_numpy()  # tradable price: last pool price of the block
-    # Signals use a 3-block median: a single block can close several percent away from the
-    # market when someone dumps into this one pool, and reverts in the next block.
-    close = dense.rolling(SIGNAL_MEDIAN_BLOCKS, min_periods=1).median().to_numpy()
-    at = lambda b: close[b - first]
-    fill_at = lambda b: fill[b - first]
+class Morpho:
+    """pos = "<marketId>:<borrower>". Daily snapshots are already exact."""
 
-    snaps = pd.read_csv("data/snapshots.csv")
-    oracle = pd.read_csv("data/oracle_eth.csv").set_index("block").eth_usd
-    snaps = snaps[(snaps.debt_usd >= MIN_DEBT_USD) & (snaps.block >= first)]
-    snaps["p_est"] = snaps.block.map(oracle) / snaps.hf  # exact only for pure ETH-vs-USD accounts
-    liq = pd.read_csv("data/liquidations.csv")
-    liq_blocks = liq.groupby("user").block.apply(lambda s: np.sort(s.unique())).to_dict()
+    name = "morpho"
+    exact_daily = True
 
-    interval = int(np.diff(np.sort(snaps.block.unique())).min())
-    live = LiveState(reserve_tokens(last))
+    def __init__(self, cache, last_block):
+        self.cache = cache
+        self.markets = morpho.load_markets()
+        snaps = pd.read_csv("data/morpho_snapshots.csv")
+        self.daily = snaps[snaps.debt_usd >= MIN_DEBT_USD]
+        liq = pd.read_csv("data/morpho_liquidations.csv")
+        self.liq_blocks = liq.groupby("pos").block.apply(lambda s: np.sort(s.unique())).to_dict()
 
-    def day_segment(block):
-        b1 = min(block + interval, last - 2)
-        return b1, close[block - first + 1 : b1 - first + 1]
+    def prefetch(self, keys):
+        pass
 
-    # exact state at the daily snapshot for every account-day that comes near its rough level
-    near = [(s.user, int(s.block)) for s in snaps.itertuples()
-            if len(day_segment(int(s.block))[1]) and day_segment(int(s.block))[1].min() <= s.p_est * (1 + ENTRY_BUFFER) * (1 + PREFILTER_SLACK)]
-    print(f"{len(near)} account-days near a rough level", file=sys.stderr)
-    live.prefetch(near)
-    near = set(near)
+    def live(self, pos, cls, block):
+        return self.cache.get(f"morpho:{pos}:{block}", lambda: morpho.live(self.markets, pos, block))
 
+    liquidation = Aave.liquidation
+
+
+SOURCES = {"aave": Aave, "morpho": Morpho}
+
+
+def load_prices():
+    eth = pd.read_csv("data/prices.csv", usecols=["block", "close"]).set_index("block").close
+    btc = pd.read_csv("data/prices_btc.csv").set_index("block").close
+    first, last = int(eth.index.min()), int(eth.index.max())
+    out = {}
+    for cls, s in (("ETH", eth), ("BTC", btc)):
+        dense = s.reindex(range(first, last + 1)).ffill().bfill()
+        # Signals use a 3-block median: a single block can close several percent away from the
+        # market when someone dumps into this one pool, and reverts in the next block.
+        out[cls] = (dense.rolling(SIGNAL_MEDIAN_BLOCKS, min_periods=1).median().to_numpy(), dense.to_numpy())
+    return first, last, out
+
+
+def run(source_names):
+    first, last, prices = load_prices()
+    cache = Cache()
     trades = []
-    users = snaps.user.unique()
-    for ui, (user, rows) in enumerate(snaps.sort_values("block").groupby("user", sort=False)):
-        armed, open_until = False, -1
-        for s in rows.itertuples():
-            b0 = int(s.block)
-            b1, seg = day_segment(b0)
-            if (user, b0) not in near:
-                armed = True  # price stayed clear of the level all day
-                continue
-            state = live.get(user, b0)
-            if state is None or state[1] < MIN_DEBT_USD:
-                continue  # not an ETH-collateral / USD-debt position
-            p_est, slack = state[0], INTRADAY_SLACK
-            if seg.min() > p_est * (1 + ENTRY_BUFFER) * (1 + slack):
-                armed = True
-                continue
-            t = b0 + 1
-            while t <= b1:
-                level = p_est * (1 + ENTRY_BUFFER)
-                window = close[t - first : b1 - first + 1]
-                if not armed:
-                    up = np.nonzero(window > level * (1 + slack) * (1 + REARM))[0]
-                    if len(up) == 0:
-                        break
-                    armed, t = True, t + int(up[0]) + 1
+    for source in [SOURCES[n](cache, last) for n in source_names]:
+        daily = source.daily[source.daily.block >= first]
+        slack0 = INTRADAY_SLACK if source.exact_daily else ROUGH_SLACK
+
+        def day_end(block):
+            return min(block + DAY, last - 2)
+
+        def day_min(cls, block):
+            seg = prices[cls][0][block - first + 1 : day_end(block) - first + 1]
+            return seg.min() if len(seg) else np.inf
+
+        near = {(r.pos, r.cls, int(r.block)) for r in daily.itertuples()
+                if day_min(r.cls, int(r.block)) <= r.p_est * (1 + ENTRY_BUFFER) * (1 + slack0)}
+        print(f"{source.name}: {len(near)} position-days near a level", file=sys.stderr)
+        source.prefetch(near)
+
+        groups = daily.sort_values("block").groupby(["pos", "cls"], sort=False)
+        for gi, ((pos, cls), rows) in enumerate(groups):
+            signal, fill = prices[cls]
+            at = lambda b: signal[b - first]
+            fill_at = lambda b: fill[b - first]
+            armed, open_until = False, -1
+            for s in rows.itertuples():
+                b0 = int(s.block)
+                b1 = day_end(b0)
+                if (pos, cls, b0) not in near:
+                    armed = True  # price stayed clear of the level all day
                     continue
-                hit = np.nonzero(window <= level * (1 + slack))[0]
-                if len(hit) == 0:
-                    break
-                t += int(hit[0])
-                state = live.get(user, t)
+                state = [s.p_est, s.debt_usd] if source.exact_daily else source.live(pos, cls, b0)
                 if state is None or state[1] < MIN_DEBT_USD:
-                    break  # not (or no longer) a qualifying position today
-                p_est, slack = state[0], 0.0
-                if at(t) > p_est * (1 + ENTRY_BUFFER):
-                    t += 1
-                    continue  # estimate was stale; keep scanning with the exact level
-                armed = False
-                if t <= open_until:
-                    t = open_until + 1
+                    continue  # not a single-asset-collateral / USD-debt position
+                p_est, slack = state[0], INTRADAY_SLACK
+                if day_min(cls, b0) > p_est * (1 + ENTRY_BUFFER) * (1 + slack):
+                    armed = True
                     continue
-                trade = simulate(user, t, p_est, state[1], at, fill_at, last, liq_blocks.get(user, []))
-                if trade:
-                    trades.append(trade)
-                    open_until = trade["exit_block"]
-                    t = open_until + 1
-                else:
-                    t += 1
-        if ui % 50 == 0:
-            print(ui, len(users), len(trades), live.calls, file=sys.stderr, flush=True)
-    live.save()
+                t = b0 + 1
+                while t <= b1:
+                    level = p_est * (1 + ENTRY_BUFFER)
+                    window = signal[t - first : b1 - first + 1]
+                    if not armed:
+                        up = np.nonzero(window > level * (1 + slack) * (1 + REARM))[0]
+                        if len(up) == 0:
+                            break
+                        armed, t = True, t + int(up[0]) + 1
+                        continue
+                    hit = np.nonzero(window <= level * (1 + slack))[0]
+                    if len(hit) == 0:
+                        break
+                    t += int(hit[0])
+                    state = source.live(pos, cls, t)
+                    if state is None or state[1] < MIN_DEBT_USD:
+                        break  # not (or no longer) a qualifying position today
+                    p_est, slack = state[0], 0.0
+                    if at(t) > p_est * (1 + ENTRY_BUFFER):
+                        t += 1
+                        continue  # estimate was stale; keep scanning with the exact level
+                    armed = False
+                    if t <= open_until:
+                        t = open_until + 1
+                        continue
+                    trade = simulate(source, pos, cls, t, p_est, state[1], at, fill_at, last)
+                    if trade:
+                        trades.append(trade)
+                        open_until = trade["exit_block"]
+                        t = open_until + 1
+                    else:
+                        t += 1
+            if gi % 100 == 0:
+                print(source.name, gi, len(groups), len(trades), cache.misses, file=sys.stderr, flush=True)
+        cache.save()
     return pd.DataFrame(trades)
 
 
-def simulate(user, t, p_liq, debt, at, fill_at, last, user_liq_blocks):
+def simulate(source, pos, cls, t, p_liq, debt, at, fill_at, last):
     """Signal at close of block t (median-filtered price); fills one block later at the pool price."""
     if t + 2 > last:
         return None
-    later = [b for b in user_liq_blocks if b > t]
-    if later and later[0] <= t + 1:
-        return None  # liquidated before we could get in
     entry = fill_at(t + 1)
     end = min(t + 1 + MAX_HOLD, last - 1)
-    liq_block = later[0] if later and later[0] <= end else None
-    stop_block = None
-    for b in range(t + 2, (liq_block or end) + 1):
-        if at(b) >= entry * (1 + STOP):
-            stop_block = b
-            break
-    if stop_block:
-        reason, signal = "stop", stop_block
-    elif liq_block:
-        reason, signal = "liquidated", liq_block
+    stop_block = next((b for b in range(t + 2, end + 1) if at(b) >= entry * (1 + STOP)), None)
+    liq_block = source.liquidation(pos, t, stop_block or end)
+    if liq_block is not None and liq_block <= t + 1:
+        return None  # liquidated before we could get in
+    if liq_block is not None:
+        reason, sig = "liquidated", liq_block
+    elif stop_block:
+        reason, sig = "stop", stop_block
     else:
-        reason, signal = "timeout", end
-    exit_price = fill_at(signal + 1)
+        reason, sig = "timeout", end
+    exit_price = fill_at(sig + 1)
     return {
-        "user": user, "debt_usd": debt, "p_liq": p_liq, "signal_block": t, "entry": entry,
-        "exit_block": signal + 1, "reason": reason, "exit": exit_price,
-        "gross_bps": 1e4 * np.log(entry / exit_price),
-        # optimistic variant: cover in the liquidation block itself
-        "gross_bps_same_block": 1e4 * np.log(entry / fill_at(signal)) if reason == "liquidated" else 1e4 * np.log(entry / exit_price),
-        "blocks_held": signal - t,
+        "source": source.name, "cls": cls, "pos": pos, "debt_usd": debt, "p_liq": p_liq, "signal_block": t,
+        "entry": entry, "exit_block": sig + 1, "reason": reason, "exit": exit_price,
+        "gross_bps": 1e4 * np.log(entry / exit_price), "blocks_held": sig - t,
+    }
+
+
+def one_at_a_time(tr):
+    """Skip signals that arrive while a trade is open."""
+    taken, busy_until = [], -1
+    for r in tr.sort_values("signal_block").itertuples():
+        if r.signal_block > busy_until:
+            taken.append(r)
+            busy_until = r.exit_block
+    return pd.DataFrame(taken)
+
+
+def summary(name, d, days):
+    one = one_at_a_time(d)
+    best_day = one.groupby(one.signal_block // DAY).net_bps.sum().max()
+    x = d.net_bps
+    return {
+        "group": name, "trades": len(d), "days": (d.signal_block // DAY).nunique(),
+        "liquidated%": 100 * (d.reason == "liquidated").mean(), "stop%": 100 * (d.reason == "stop").mean(),
+        "net_bps": x.mean(), "t": x.mean() / (x.std(ddof=1) / np.sqrt(len(x))) if len(x) > 1 else np.nan,
+        "1pos_trades": len(one), "1pos_APR%": one.net_bps.sum() / 100 * 365 / days,
+        "APR_ex_best_day%": (one.net_bps.sum() - best_day) / 100 * 365 / days,
     }
 
 
 def report(tr):
+    first, last, _ = load_prices()
+    days = (last - first) * 12 / 86400
     tr["net_bps"] = tr.gross_bps - ROUND_TRIP_FEE_BPS
     print(f"entry {ENTRY_BUFFER:.2%} above liquidation price, stop {STOP:.2%}, max hold {MAX_HOLD} blocks, "
-          f"debt >= ${MIN_DEBT_USD / 1e6:.0f}M")
-    print(f"{len(tr)} trades on {tr.user.nunique()} accounts, {(tr.signal_block // 7200).nunique()} distinct days\n")
-    rows = []
-    for name, d in [("all", tr)] + [(r, tr[tr.reason == r]) for r in ["liquidated", "stop", "timeout"]]:
-        if len(d):
-            rows.append({"outcome": name, "n": len(d), "share%": 100 * len(d) / len(tr),
-                         "gross_bps": d.gross_bps.mean(), "median": d.gross_bps.median(),
-                         "net_bps": d.net_bps.mean(), "win%": 100 * (d.net_bps > 0).mean(),
-                         "median_blocks": d.blocks_held.median()})
+          f"debt >= ${MIN_DEBT_USD / 1e6:.0f}M, {days:.0f} days")
+    rows = [summary("ALL", tr, days)]
+    for cls in sorted(tr.cls.unique()):
+        rows.append(summary(cls, tr[tr.cls == cls], days))
+    for (src, cls), d in tr.groupby(["source", "cls"]):
+        rows.append(summary(f"{src} {cls}", d, days))
     print(pd.DataFrame(rows).round(1).to_string(index=False))
-    x = tr.net_bps
-    print(f"\nnet per trade: mean {x.mean():.1f} bps, t-stat {x.mean() / (x.std(ddof=1) / np.sqrt(len(x))):.2f}, "
-          f"sum {x.sum():.0f} bps")
-    print(f"if covered in the liquidation block itself: mean gross {tr.gross_bps_same_block.mean():.1f} bps")
-
-    # one position at a time: skip signals that arrive while a trade is open
-    taken, busy_until = [], -1
-    for _, r in tr.sort_values("signal_block").iterrows():
-        if r.signal_block > busy_until:
-            taken.append(r)
-            busy_until = r.exit_block
-    one = pd.DataFrame(taken)
-    print(f"\none position at a time: {len(one)} trades, net mean {one.net_bps.mean():.1f} bps, "
-          f"sum {one.net_bps.sum():.0f} bps, win {100 * (one.net_bps > 0).mean():.0f}%, "
-          f"liquidated {100 * (one.reason == 'liquidated').mean():.0f}% / stop {100 * (one.reason == 'stop').mean():.0f}%")
-
+    print("\nby outcome:")
+    print(tr.groupby("reason").agg(n=("net_bps", "size"), net_bps=("net_bps", "mean"), median=("net_bps", "median"),
+                                    median_blocks=("blocks_held", "median")).round(1).to_string())
     print("\nby position size (debt):")
-    rows = []
-    for lo, hi in [(2e6, 5e6), (5e6, 2e7), (2e7, 1e12)]:
-        d = tr[(tr.debt_usd >= lo) & (tr.debt_usd < hi)]
-        if len(d):
-            rows.append({"debt": f"${lo / 1e6:.0f}M-{hi / 1e6:.0f}M" if hi < 1e11 else f">${lo / 1e6:.0f}M", "n": len(d),
-                         "liquidated%": 100 * (d.reason == "liquidated").mean(), "stop%": 100 * (d.reason == "stop").mean(),
-                         "net_bps": d.net_bps.mean(), "win%": 100 * (d.net_bps > 0).mean()})
-    print(pd.DataFrame(rows).round(1).to_string(index=False))
+    size = pd.cut(tr.debt_usd, [0, 5e6, 2e7, 1e12], labels=["$2-5M", "$5-20M", ">$20M"])
+    print(tr.groupby(size, observed=True).agg(n=("net_bps", "size"), liquidated=("reason", lambda s: 100 * (s == "liquidated").mean()),
+                                               net_bps=("net_bps", "mean")).round(1).to_string())
 
 
 if __name__ == "__main__":
     out = os.environ.get("OUT", "data/trades.csv")
+    names = [a for a in sys.argv[1:] if not a.startswith("--")] or ["aave", "morpho", "fluid"]
     if "--report-only" in sys.argv:
         trades = pd.read_csv(out)
     else:
-        trades = run()
+        if "fluid" in names:
+            from fluid import Fluid
+
+            SOURCES["fluid"] = Fluid
+        trades = run(names)
         trades.to_csv(out, index=False)
     report(trades)
