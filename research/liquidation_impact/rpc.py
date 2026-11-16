@@ -9,10 +9,11 @@ ENDPOINTS = [
 _session = requests.Session()
 
 
-def call(method, params, retries=6):
+def call(method, params, retries=6, prefer=0):
+    """`prefer` picks which endpoint is tried first (lets two jobs avoid sharing a rate limit)."""
     last = None
     for attempt in range(retries):
-        url = ENDPOINTS[attempt % len(ENDPOINTS)]
+        url = ENDPOINTS[(attempt + prefer) % len(ENDPOINTS)]
         try:
             r = _session.post(
                 url,
@@ -29,7 +30,7 @@ def call(method, params, retries=6):
     raise RuntimeError(f"{method} failed: {last}")
 
 
-def get_logs(address, topics, start, end, step=50_000):
+def get_logs(address, topics, start, end, step=50_000, prefer=0):
     """Fetch logs over [start, end], halving the range when a provider rejects it."""
     out = []
     lo = start
@@ -40,6 +41,7 @@ def get_logs(address, topics, start, end, step=50_000):
                 "eth_getLogs",
                 [{"address": address, "topics": topics, "fromBlock": hex(lo), "toBlock": hex(hi)}],
                 retries=3,
+                prefer=prefer,
             )
             lo = hi + 1
         except RuntimeError:
