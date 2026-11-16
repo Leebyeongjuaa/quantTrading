@@ -25,6 +25,7 @@ ENTRY_BUFFER = float(os.environ.get("ENTRY_BUFFER", 0.003))
 STOP = float(os.environ.get("STOP", 0.005))
 MAX_HOLD = int(os.environ.get("MAX_HOLD", 7200))
 MIN_DEBT_USD = float(os.environ.get("MIN_DEBT_USD", 2_000_000))
+SIGNAL_MEDIAN_BLOCKS = 3
 REARM = 0.002  # price must first sit this far above the entry level before a (re-)entry
 PREFILTER_SLACK = 0.03  # daily snapshots within this distance of the level get an exact on-chain check
 INTRADAY_SLACK = 0.005  # re-check on-chain state when price is this close to the last known level
@@ -135,8 +136,13 @@ class LiveState:
 def run():
     px = pd.read_csv("data/prices.csv", usecols=["block", "close"]).set_index("block").close
     first, last = int(px.index.min()), int(px.index.max())
-    close = px.reindex(range(first, last + 1)).ffill().to_numpy()
+    dense = px.reindex(range(first, last + 1)).ffill()
+    fill = dense.to_numpy()  # tradable price: last pool price of the block
+    # Signals use a 3-block median: a single block can close several percent away from the
+    # market when someone dumps into this one pool, and reverts in the next block.
+    close = dense.rolling(SIGNAL_MEDIAN_BLOCKS, min_periods=1).median().to_numpy()
     at = lambda b: close[b - first]
+    fill_at = lambda b: fill[b - first]
 
     snaps = pd.read_csv("data/snapshots.csv")
     oracle = pd.read_csv("data/oracle_eth.csv").set_index("block").eth_usd
@@ -201,7 +207,7 @@ def run():
                 if t <= open_until:
                     t = open_until + 1
                     continue
-                trade = simulate(user, t, p_est, state[1], at, last, liq_blocks.get(user, []))
+                trade = simulate(user, t, p_est, state[1], at, fill_at, last, liq_blocks.get(user, []))
                 if trade:
                     trades.append(trade)
                     open_until = trade["exit_block"]
@@ -214,14 +220,14 @@ def run():
     return pd.DataFrame(trades)
 
 
-def simulate(user, t, p_liq, debt, at, last, user_liq_blocks):
-    """Decision at close of block t; every fill happens one block after its signal."""
+def simulate(user, t, p_liq, debt, at, fill_at, last, user_liq_blocks):
+    """Signal at close of block t (median-filtered price); fills one block later at the pool price."""
     if t + 2 > last:
         return None
     later = [b for b in user_liq_blocks if b > t]
     if later and later[0] <= t + 1:
         return None  # liquidated before we could get in
-    entry = at(t + 1)
+    entry = fill_at(t + 1)
     end = min(t + 1 + MAX_HOLD, last - 1)
     liq_block = later[0] if later and later[0] <= end else None
     stop_block = None
@@ -235,13 +241,13 @@ def simulate(user, t, p_liq, debt, at, last, user_liq_blocks):
         reason, signal = "liquidated", liq_block
     else:
         reason, signal = "timeout", end
-    exit_price = at(signal + 1)
+    exit_price = fill_at(signal + 1)
     return {
         "user": user, "debt_usd": debt, "p_liq": p_liq, "signal_block": t, "entry": entry,
         "exit_block": signal + 1, "reason": reason, "exit": exit_price,
         "gross_bps": 1e4 * np.log(entry / exit_price),
         # optimistic variant: cover in the liquidation block itself
-        "gross_bps_same_block": 1e4 * np.log(entry / at(signal)) if reason == "liquidated" else 1e4 * np.log(entry / exit_price),
+        "gross_bps_same_block": 1e4 * np.log(entry / fill_at(signal)) if reason == "liquidated" else 1e4 * np.log(entry / exit_price),
         "blocks_held": signal - t,
     }
 
@@ -287,7 +293,7 @@ def report(tr):
 
 
 if __name__ == "__main__":
-    out = "data/trades.csv"
+    out = os.environ.get("OUT", "data/trades.csv")
     if "--report-only" in sys.argv:
         trades = pd.read_csv(out)
     else:

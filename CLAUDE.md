@@ -14,7 +14,12 @@ quantTrading/
         ├── rpc.py                  # JSON-RPC helper (public endpoints, no API key)
         ├── fetch_liquidations.py   # Aave v3 LiquidationCall events -> data/liquidations.csv
         ├── fetch_swaps.py          # Uniswap ETH/USDC swap ticks -> data/swaps.csv
-        └── analyze.py              # Event study (run: python3 analyze.py [v3|v4])
+        ├── analyze.py              # Event study (run: python3 analyze.py [v3|v4])
+        ├── fetch_prices.py         # Per-block ETH price from the Uniswap pool -> data/prices.csv
+        ├── fetch_borrowers.py      # Large stablecoin borrowers on Aave v3 -> data/borrowers.csv
+        ├── snapshots.py            # Daily historical health factors -> data/snapshots.csv
+        └── backtest.py             # Short ETH just above large liquidation prices
+                                    # (env: ENTRY_BUFFER, STOP, MAX_HOLD, MIN_DEBT_USD; needs eth-abi)
 ```
 
 > **Note:** This file should be updated as modules, services, and tooling are added.
