@@ -15,7 +15,8 @@ quantTrading/
 │   ├── config.py        # Aero Base contract addresses, minimal ABIs, launch timestamp
 │   ├── rpc.py           # retrying RPC wrapper + multicall3 batching + chunked eth_getLogs
 │   ├── fetch_data.py    # collects gauges / fee releases / incentives / hourly supply / prices → data/
-│   └── backtest.py      # hourly panel + walk-forward strategy backtest (47h cooldown)
+│   ├── backtest.py      # hourly panel + walk-forward strategy backtest (47h cooldown)
+│   └── onetick_apr.py   # live one-tick (one tickSpacing) LP emission APR for top-volume Slipstream pools
 ├── data/                # CSV snapshots produced by fetch_data.py (committed for reproducibility)
 └── reports/             # backtest reports (markdown)
 ```
@@ -43,6 +44,7 @@ python -m aero_voting.fetch_data --stage all                # full fetch, ~30 mi
 python -m aero_voting.fetch_data --stage all --incremental  # refresh: fee releases only after the last stored block
 python -m aero_voting.fetch_data --stage repair-ts          # recompute fee-event timestamps/supply from real block times
 python -m aero_voting.backtest --amount 100000 --window 168 --topn 5 --report reports/aero_voting_backtest.md
+python -m aero_voting.onetick_apr --top 10                  # volume ranking from GeckoTerminal, APR from on-chain rewardGrowthGlobalX128
 ```
 
 ## Development Workflow
@@ -57,4 +59,4 @@ python -m aero_voting.backtest --amount 100000 --window 168 --topn 5 --report re
 - Do not introduce security vulnerabilities (injection, XSS, etc.).
 - Prefer editing existing files over creating new ones.
 - Update this CLAUDE.md whenever significant structure or tooling changes are made.
-- Only public RPCs / public APIs (DefiLlama) are used; no keys required.
+- Only public RPCs / public APIs (DefiLlama, GeckoTerminal) are used; no keys required.
