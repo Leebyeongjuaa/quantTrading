@@ -9,7 +9,12 @@ This is the `quantTrading` repository — a quantitative trading project. The co
 ```
 quantTrading/
 ├── CLAUDE.md          # This file — AI assistant guide
-└── .git/              # Git repository
+└── research/
+    └── liquidation_impact/   # Event study: DEX price around Aave v3 liquidations
+        ├── rpc.py                  # JSON-RPC helper (public endpoints, no API key)
+        ├── fetch_liquidations.py   # Aave v3 LiquidationCall events -> data/liquidations.csv
+        ├── fetch_swaps.py          # Uniswap ETH/USDC swap ticks -> data/swaps.csv
+        └── analyze.py              # Event study (run: python3 analyze.py [v3|v4])
 ```
 
 > **Note:** This file should be updated as modules, services, and tooling are added.

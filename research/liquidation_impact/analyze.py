@@ -14,7 +14,7 @@ import pandas as pd
 from fetch_swaps import eth_long_liquidations
 
 HORIZONS = [0, 1, 2, 5, 10, 25, 50, 100]
-POOL = sys.argv[1] if len(sys.argv) > 1 else "v4"
+POOL = sys.argv[1] if len(sys.argv) > 1 else "v3"
 ROUND_TRIP_FEE_BPS = {"v4": 2.5, "v3": 10.0}[POOL]
 
 swaps = pd.read_csv("data/swaps.csv")
@@ -147,3 +147,29 @@ print(pd.DataFrame(tbl).round(2).to_string(index=False))
 
 print("\n-- 12 largest liquidation blocks --")
 print(ev.nlargest(12, "usd")[["block", "usd", "n_liq", "pre_25", "leg1", "leg2", "post_0", "post_1", "post_5", "post_25"]].round(1).to_string(index=False))
+
+# --- blocks where a liquidation tx itself traded in this pool ----------------
+def robust(x):
+    x = x.dropna()
+    return {"mean": x.mean(), "median": x.median(), "win%": 100 * (x > 0).mean(),
+            "t": x.mean() / (x.std(ddof=1) / np.sqrt(len(x)))}
+
+
+print("\n-- liquidation tx sold in this pool: impact and rebound by size --")
+tbl = []
+for lo, hi, name in [(0, 1e5, "<$100k"), (1e5, 1e6, "$100k-1M"), (1e6, 1e12, ">$1M")]:
+    d = ev[(ev.usd >= lo) & (ev.usd < hi) & ev.touched_ref_pool]
+    legs = {
+        "sale impact": d.leg2,
+        "rebound, same block": d.post_0,
+        "rebound, by B+1": d.post_1,
+        "rebound, by B+5": d.post_5,
+        "short before sale -> end of B": -(d.leg2 + d.post_0),
+        "long end of B -> B+5": d.post_5 - d.post_0,
+    }
+    for leg, x in legs.items():
+        tbl.append({"size": name, "n": len(d), "leg": leg, **robust(x)})
+print(pd.DataFrame(tbl).round(1).to_string(index=False))
+big = ev[ev.usd >= 1e6]
+print(f"\n>$1M blocks: {len(big)} blocks on {(big.block // 7200).nunique()} distinct days; "
+      f"liquidation was the first tx to move the pool in {100 * (big.leg1 == 0).mean():.0f}% of them")
