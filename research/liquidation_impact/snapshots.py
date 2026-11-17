@@ -1,5 +1,11 @@
 """Daily Aave v3 account snapshots for large stablecoin borrowers -> data/snapshots.csv.
 
+Environment (all optional): MIN_CUMULATIVE_BORROW_USD (who is tracked, default $2M),
+SNAPSHOT_MIN_DEBT_USD (rows kept, default $1M), BLOCKS="start,end" (explicit grid),
+SNAPSHOT_INTERVAL (blocks between snapshots), PAIRS=file.csv (only these block,user pairs).
+A cheap way to track many small accounts: weekly snapshots for everyone, then PAIRS for the
+days of the weeks in which an account started close to liquidation.
+
 For every candidate in data/borrowers.csv and every 7200th block of the study period,
 reads Pool.getUserAccountData at that historical block (through Multicall3) and keeps
 rows with at least MIN_DEBT_USD of debt. Also records the Aave oracle ETH price at each
@@ -26,9 +32,9 @@ ENDPOINTS = [
     "https://gateway.tenderly.co/public/mainnet",
     "https://eth.drpc.org",
 ]
-MIN_CUMULATIVE_BORROW_USD = 2_000_000
-MIN_DEBT_USD = 1_000_000
-INTERVAL = 7200  # blocks, about one day
+MIN_CUMULATIVE_BORROW_USD = float(os.environ.get("MIN_CUMULATIVE_BORROW_USD", 2_000_000))  # who is tracked
+MIN_DEBT_USD = float(os.environ.get("SNAPSHOT_MIN_DEBT_USD", 1_000_000))  # rows kept
+INTERVAL = int(os.environ.get("SNAPSHOT_INTERVAL", 7200))  # blocks; 7200 is about one day
 CHUNK = 400
 _local = threading.local()
 
@@ -84,10 +90,16 @@ def main():
         lo, hi = map(int, os.environ["BLOCKS"].split(","))
         blocks = range(lo, hi, INTERVAL)
     tasks = []
-    for blk in blocks:
-        for i in range(0, len(users), CHUNK):
-            tasks.append((blk, users[i : i + CHUNK], len(tasks)))
-    print(f"{len(users)} users x {len(blocks)} snapshots = {len(tasks)} multicalls", file=sys.stderr)
+    if os.environ.get("PAIRS"):  # csv with columns block,user: snapshot only these account-blocks
+        for blk, grp in pd.read_csv(os.environ["PAIRS"]).groupby("block"):
+            who = list(grp.user)
+            for i in range(0, len(who), CHUNK):
+                tasks.append((int(blk), who[i : i + CHUNK], len(tasks)))
+    else:
+        for blk in blocks:
+            for i in range(0, len(users), CHUNK):
+                tasks.append((blk, users[i : i + CHUNK], len(tasks)))
+    print(f"{len(users)} users, {len(tasks)} multicalls", file=sys.stderr)
     oracle = {}
     with open("data/snapshots.csv", "w", newline="") as f, ThreadPoolExecutor(6) as pool:
         w = csv.writer(f)

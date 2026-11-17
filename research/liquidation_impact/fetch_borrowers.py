@@ -5,6 +5,7 @@ Scans Borrow events since the pool's deployment and writes data/borrowers.csv
 """
 import collections
 import csv
+import os
 import sys
 
 import rpc
@@ -24,7 +25,7 @@ STABLES = {  # address -> decimals
     "0xf939e0a03fb07f59a73314e73794be0e57ac1b4e": 18,  # crvUSD
     "0x5f98805a4e8be255a32880fdec7f6728c6568ba0": 18,  # LUSD
 }
-MIN_CUMULATIVE_USD = 500_000
+MIN_CUMULATIVE_USD = float(os.environ.get("MIN_CUMULATIVE_USD", 500_000))
 
 
 def main():
