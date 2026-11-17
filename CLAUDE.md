@@ -22,10 +22,15 @@ quantTrading/
         ├── fluid.py                # Fluid vaults: liquidations, daily positions
         ├── liquidator_flows.py     # Do liquidators sell seized collateral on a DEX in the same tx?
         ├── placebo.py              # Same backtest on fake levels: is the edge liquidation-specific?
+        ├── merge_periods.py        # Combine datasets downloaded for different periods
         └── backtest.py             # Short ETH/BTC just above large liquidation prices
                                     # (run: python3 backtest.py [aave] [morpho] [fluid];
                                     #  --grid sweeps entry x stop, --exits compares exit rules;
-                                    #  env: ENTRY_BUFFER, STOP, MAX_HOLD, MIN_DEBT_USD; needs eth-abi)
+                                    #  env: ENTRY_BUFFER, STOP, MAX_HOLD, MIN_DEBT_USD, MAX_ENTRY_SLIP,
+                                    #  TAKE_PROFIT, DEFEND_EXIT; needs eth-abi)
+
+All scripts read and write `./data` relative to the working directory (git-ignored), so a
+second period can be built in its own folder and merged with `merge_periods.py`.
 ```
 
 > **Note:** This file should be updated as modules, services, and tooling are added.
