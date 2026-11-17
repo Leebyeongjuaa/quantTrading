@@ -10,6 +10,7 @@ Rule (all decisions use information available at that block):
             (b) price closes STOP above the entry    -> cover one block later
             (c) MAX_HOLD blocks pass                 -> cover
           optional:
+            MAX_ENTRY_SLIP: skip the entry when the fill would be that far below the signal price
             (d) TAKE_PROFIT: price closes that far below the entry -> cover one block later
             (e) DEFEND_EXIT: the borrower adds margin / repays so that P_liq drops by more than
                 that fraction (or the position stops qualifying)   -> cover one block later
@@ -39,6 +40,7 @@ STOP = float(os.environ.get("STOP", 0.005))
 MAX_HOLD = int(os.environ.get("MAX_HOLD", 7200))
 TAKE_PROFIT = float(os.environ.get("TAKE_PROFIT", 0))  # 0 = off
 DEFEND_EXIT = float(os.environ.get("DEFEND_EXIT", 0))  # 0 = off
+MAX_ENTRY_SLIP = float(os.environ.get("MAX_ENTRY_SLIP", 0))  # 0 = off; entry is a limit order
 MIN_DEBT_USD = float(os.environ.get("MIN_DEBT_USD", 2_000_000))
 SIGNAL_MEDIAN_BLOCKS = 3
 REARM = 0.002  # price must first sit this far above the entry level before a (re-)entry
@@ -328,6 +330,10 @@ def simulate(source, pos, cls, t, p_liq, debt, at, fill_at, last):
     if t + 2 > last:
         return None
     entry = fill_at(t + 1)
+    if MAX_ENTRY_SLIP and entry < at(t) * (1 - MAX_ENTRY_SLIP):
+        # The pool closed far below the price we acted on (someone dumped into it in that block).
+        # A limit order would not have filled there, so there is no trade.
+        return None
     end = min(t + 1 + MAX_HOLD, last - 1)
     reason, sig = "timeout", end
     for b in range(t + 2, end + 1):
