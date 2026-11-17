@@ -113,6 +113,7 @@ class Aave:
         self.liq_blocks = liq.groupby("user").block.apply(lambda s: np.sort(s.unique())).to_dict()
         self.tokens = self._reserve_tokens(last_block)
         self.per_user = 1 + 3 * len(self.tokens)
+        self.skip = set()
 
     def _reserve_tokens(self, block):
         assets = [(c, a) for c, lst in AAVE_ASSETS.items() for a in lst]
@@ -156,10 +157,29 @@ class Aave:
         return res
 
     def prefetch(self, keys):
-        """keys: (pos, cls, block). Batches accounts that share a block."""
+        """keys: (pos, cls, block). Reads each account once per week first; the other days of that
+        week are fetched only for the classes the account qualified for (composition rarely
+        changes within days, and most accounts near HF 1 are stable-vs-stable loops)."""
+        week = lambda block: block // (7 * DAY)
+        probes = {}
+        for user, _, block in keys:
+            k = (user, week(block))
+            probes[k] = min(block, probes.get(k, block))
+        self._fetch_accounts({(u, b) for (u, _), b in probes.items()}, "probe")
+        rest = set()
+        for user, cls, block in keys:
+            if self.cache.data.get(f"aave:{user}:{cls}:{probes[(user, week(block))]}") is None:
+                self.skip.add((user, cls, block))  # not that kind of position this week
+            else:
+                rest.add((user, block))
+        self._fetch_accounts(rest, "days")
+
+    def _fetch_accounts(self, pairs, label):
+        """pairs: (pos, block). Batches accounts that share a block."""
         by_block = {}
-        for user, block in {(u, b) for u, c, b in keys if f"aave:{u}:{c}:{b}" not in self.cache.data}:
-            by_block.setdefault(block, []).append(user)
+        for user, block in pairs:
+            if f"aave:{user}:ETH:{block}" not in self.cache.data:
+                by_block.setdefault(block, []).append(user)
         tasks = [(b, us[i : i + 40], n) for n, (b, us) in enumerate(by_block.items()) for i in range(0, len(us), 40)]
 
         def work(task):
@@ -174,11 +194,14 @@ class Aave:
         with ThreadPoolExecutor(6) as pool:
             for n, res in enumerate(pool.map(work, tasks)):
                 self.cache.data.update(res)
-                if n % 100 == 0:
-                    print("aave prefetch", n, len(tasks), file=sys.stderr, flush=True)
+                if n % 200 == 0:
+                    print(f"aave prefetch {label}", n, len(tasks), file=sys.stderr, flush=True)
         self.cache.save()
 
     def live(self, pos, cls, block):
+        if (pos, cls, block) in self.skip:
+            return None
+
         def fetch():
             res = self._parse(multicall(self._calls(pos), block, 0))
             for c, v in res.items():
