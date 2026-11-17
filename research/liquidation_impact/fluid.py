@@ -41,6 +41,17 @@ VAULTS = {
 }
 
 
+_resolver_code = {}
+
+
+def resolver_override():
+    """The positions resolver was deployed long after the vaults (block ~24.35M). Injecting its
+    current bytecode lets the same view calls run at any earlier block."""
+    if not _resolver_code:
+        _resolver_code[POSITIONS_RESOLVER] = {"code": rpc.call("eth_getCode", [POSITIONS_RESOLVER, "latest"])}
+    return _resolver_code
+
+
 def signed(word):
     v = int(word, 16)
     return v - (1 << 256) if v >> 255 else v
@@ -77,7 +88,8 @@ def value_positions(vault, out):
 
 def state(pos, block, worker=0):
     vault, nft = pos.split(":")
-    v = value_positions(vault, multicall(vault_calls(vault, [int(nft)]), block, worker)).get(int(nft))
+    out = multicall(vault_calls(vault, [int(nft)]), block, worker, resolver_override())
+    v = value_positions(vault, out).get(int(nft))
     return list(v) if v else None
 
 
@@ -108,12 +120,14 @@ def main():
                 w.writerow([int(l["blockNumber"], 16), l["transactionHash"], l["address"], cls,
                             round(int(l["data"][2:][128:192], 16) / 10**debt_dec, 2)])
 
+    override = resolver_override()
+
     def snapshot(args):
         block, worker = args
         rows = []
         for vault, nfts in universe.items():
             for i in range(0, len(nfts), 150):
-                out = multicall(vault_calls(vault, nfts[i : i + 150]), block, worker)
+                out = multicall(vault_calls(vault, nfts[i : i + 150]), block, worker, override)
                 for nft, (p_liq, debt, _) in value_positions(vault, out).items():
                     if debt >= MIN_DEBT_USD:
                         rows.append([block, f"{vault}:{nft}", VAULTS[vault][0], round(debt), p_liq])

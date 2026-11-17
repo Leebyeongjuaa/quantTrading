@@ -20,7 +20,8 @@ STEP = 4000
 
 def main():
     liq = pd.read_csv("data/liquidations.csv", usecols=["block"])
-    start, end = int(liq.block.min()) - 7200, int(rpc.call("eth_blockNumber", []), 16)
+    head = int(rpc.call("eth_blockNumber", []), 16)
+    start, end = int(liq.block.min()) - 7200, min(head, int(liq.block.max()) + 7200)
     with open("data/prices.csv", "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["block", "open", "low", "high", "close", "n"])

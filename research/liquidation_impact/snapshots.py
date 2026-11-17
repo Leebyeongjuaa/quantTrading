@@ -7,6 +7,7 @@ snapshot block in data/oracle_eth.csv. Only data available at that block is used
 implied liquidation price (oracle price / health factor) is known ex ante.
 """
 import csv
+import os
 import sys
 import threading
 import time
@@ -32,11 +33,12 @@ CHUNK = 400
 _local = threading.local()
 
 
-def multicall(calls, block, worker):
-    """calls: list of (target, calldata bytes). Returns list of (success, returndata)."""
+def multicall(calls, block, worker, overrides=None):
+    """calls: list of (target, calldata bytes). Returns list of (success, returndata).
+    overrides: optional eth_call state override, e.g. {address: {"code": "0x..."}}."""
     data = "0x82ad56cb" + encode(["(address,bool,bytes)[]"], [[(t, True, d) for t, d in calls]]).hex()
     payload = {"jsonrpc": "2.0", "id": 1, "method": "eth_call",
-               "params": [{"to": MULTICALL3, "data": data}, hex(block)]}
+               "params": [{"to": MULTICALL3, "data": data}, hex(block)] + ([overrides] if overrides else [])}
     if not hasattr(_local, "s"):
         _local.s = requests.Session()
     last = None
@@ -78,6 +80,9 @@ def main():
     users = list(b[b.cumulative_usd >= MIN_CUMULATIVE_BORROW_USD].user)
     liq = pd.read_csv("data/liquidations.csv", usecols=["block"])
     blocks = range(int(liq.block.min()) - INTERVAL, int(liq.block.max()), INTERVAL)
+    if os.environ.get("BLOCKS"):  # "start,end": explicit snapshot grid, e.g. to extend an existing one backwards
+        lo, hi = map(int, os.environ["BLOCKS"].split(","))
+        blocks = range(lo, hi, INTERVAL)
     tasks = []
     for blk in blocks:
         for i in range(0, len(users), CHUNK):
