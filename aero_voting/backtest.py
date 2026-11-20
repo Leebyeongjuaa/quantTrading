@@ -44,7 +44,7 @@ def price_lookup(prices: pd.DataFrame, hours: np.ndarray) -> pd.DataFrame:
 
 def build_panel(verbose=True, drop_first_release=True, spot_haircut=1.0):
     """spot_haircut: value fees/incentives paid in tokens that have no external market price (priced only from an
-    Aero pool's spot, see fetch_data.pool_spot_prices) at this fraction, since they are thin and costly to sell."""
+    Aero pool, see fetch_data.onchain_price_history) at this fraction, since they are thin and costly to sell."""
     gauges = pd.read_csv(os.path.join(DATA, "gauges.csv"))
     fees = pd.read_csv(os.path.join(DATA, "fee_events.csv"))
     inc = pd.read_csv(os.path.join(DATA, "incentives.csv"))
@@ -55,7 +55,7 @@ def build_panel(verbose=True, drop_first_release=True, spot_haircut=1.0):
     ptab = price_lookup(prices, hours)
     priced = set(ptab.columns)
     raw = pd.read_csv(os.path.join(DATA, "prices.csv"))
-    spot = set(raw.loc[raw.get("source", pd.Series(dtype=str)) == "pool_spot", "token"].str.lower()) if "source" in raw else set()
+    spot = set(raw.loc[raw["source"].isin(["pool_spot", "onchain"]), "token"].str.lower()) if "source" in raw else set()
     mult = {t: (spot_haircut if t in spot else 1.0) for t in priced}
 
     def usd(token_series, amount_series, hour_series):

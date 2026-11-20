@@ -250,50 +250,102 @@ class Fetcher:
                 log.warning("no llama price for %s", t)
         df = pd.DataFrame(rows, columns=["token", "ts", "price", "symbol", "decimals"])
         df = df.drop_duplicates(["token", "ts"])
-        missing = [t for t in tokens if t not in set(df.token)]
-        spot = self.pool_spot_prices(missing, df)
-        if len(spot):
-            df = pd.concat([df, spot], ignore_index=True)
-        return df
+        return self.add_onchain(df, tokens)
 
-    def pool_spot_prices(self, missing: list[str], priced: pd.DataFrame) -> pd.DataFrame:
-        """Fallback: price a token from the current spot of an Aero pool pairing it with a priced token.
-        One constant price (stamped at launch) - acceptable for tokenized stocks / long-tail over a ~2 week window."""
+    def add_onchain(self, llama: pd.DataFrame, tokens: list[str]) -> pd.DataFrame:
+        """Replace missing / stale / patchy DefiLlama series with hourly on-chain pool prices."""
+        llama = llama[llama.get("source", pd.Series("llama", index=llama.index)).fillna("llama").isin(["llama", ""])
+                      ] if "source" in llama else llama
+        bad = self.needs_onchain(llama, tokens)
+        llama = llama.assign(source="llama")
+        onchain = self.onchain_price_history(bad, llama[~llama.token.str.lower().isin({t.lower() for t in bad})])
+        # replace a DefiLlama series only where an on-chain series exists; otherwise keep what DefiLlama has
+        replaced = set(onchain.token.str.lower()) if len(onchain) else set()
+        keep = llama[~llama.token.str.lower().isin(replaced)]
+        log.info("prices: %d tokens from DefiLlama, %d replaced/added from on-chain pools, %d flagged without a pool",
+                 keep.token.nunique(), len(replaced), len({t.lower() for t in bad} - replaced))
+        return pd.concat([keep, onchain], ignore_index=True)
+
+    def needs_onchain(self, llama: pd.DataFrame, tokens: list[str]) -> list[str]:
+        """Tokens DefiLlama does not price reliably: no series, a series that stops more than 6h before head
+        (DefiLlama stops updating some feeds; VEIL froze on 2026-11-09 at 6x its pool price), or a series that
+        covers less than 70% of the hours since launch."""
+        hours = (self.head_ts - LAUNCH_TS) / 3600
+        st = llama.groupby(llama.token.str.lower()).ts.agg(["max", "count"])
+        out = []
+        for t in tokens:
+            k = t.lower()
+            if k not in st.index or st.at[k, "max"] < self.head_ts - 6 * 3600 or st.at[k, "count"] < 0.7 * hours:
+                out.append(t)
+        return out
+
+    def onchain_price_history(self, tokens: list[str], llama: pd.DataFrame) -> pd.DataFrame:
+        """Hourly USD price history from the deepest Aero pool pairing each token with a reliably priced token:
+        pool price (CL slot0 or basic-pool reserves) at the block of every hour x the other token's DefiLlama
+        price. A 3-hour rolling median removes single-block spikes."""
         gauges = pd.read_csv(os.path.join(DATA, "gauges.csv"))
-        last_px = priced.sort_values("ts").groupby("token").price.last().to_dict()
-        tmeta = self.token_meta(sorted(set(missing) | set(last_px)))
-        rows, w3 = [], self.w3
-        slot0_abi = [{"type": "function", "name": "slot0", "stateMutability": "view", "inputs": [], "outputs": [
-            {"type": "uint160"}, {"type": "int24"}, {"type": "uint16"}, {"type": "uint16"}, {"type": "uint16"}, {"type": "bool"}]}]
-        res_abi = [{"type": "function", "name": "getReserves", "stateMutability": "view", "inputs": [], "outputs": [
-            {"type": "uint256"}, {"type": "uint256"}, {"type": "uint256"}]}]
-        for t in missing:
-            cands = gauges[((gauges.token0.str.lower() == t.lower()) & gauges.token1.isin(last_px)) |
-                           ((gauges.token1.str.lower() == t.lower()) & gauges.token0.isin(last_px))]
-            cands = cands.sort_values("weight_now", ascending=False)
-            for pool in cands.itertuples():
-                try:
-                    is0 = pool.token0.lower() == t.lower()
-                    other = pool.token1 if is0 else pool.token0
-                    d_t, d_o = tmeta[t]["decimals"], tmeta[other]["decimals"]
-                    if pool.tick_spacing > 0:
-                        c = w3.eth.contract(address=cs(pool.pool), abi=slot0_abi)
-                        sqrt_p = self.rpc.call(lambda w3: c.functions.slot0().call())[0]
-                        p01 = (sqrt_p / 2 ** 96) ** 2  # raw token1 per raw token0
-                        px_t_in_other = (p01 if is0 else 1 / p01) * 10 ** ((d_t - d_o) if is0 else (d_t - d_o))
+        good = set(llama.token.str.lower()) - {t.lower() for t in tokens}
+        grid = sorted(range(LAUNCH_TS, self.head_ts + 1, 3600))
+        ref = llama.assign(token=llama.token.str.lower(), hour=(llama.ts // 3600) * 3600)
+        ref = ref.groupby(["hour", "token"]).price.mean().unstack()
+        ref = ref.reindex(sorted(set(ref.index) | set(grid))).ffill().bfill().loc[grid]
+        bal_abi = [{"type": "function", "name": "balanceOf", "stateMutability": "view", "inputs": [{"type": "address"}], "outputs": [{"type": "uint256"}]}]
+        slot0 = ["uint160", "int24", "uint16", "uint16", "uint16", "bool"]
+        slot0_abi = [{"type": "function", "name": "slot0", "stateMutability": "view", "inputs": [], "outputs": [{"type": t} for t in slot0]}]
+        res_abi = [{"type": "function", "name": "getReserves", "stateMutability": "view", "inputs": [], "outputs": [{"type": "uint256"}] * 3}]
+        tmeta = self.token_meta(sorted({t for t in tokens} | {cs(t) for t in good if t in set(gauges.token0.str.lower()) | set(gauges.token1.str.lower())}))
+        tmeta = {k.lower(): v for k, v in tmeta.items()}
+
+        # pick the pool holding the most of the reliably priced side, measured now
+        cands = []
+        for t in tokens:
+            tl = t.lower()
+            for r in gauges.itertuples():
+                t0, t1 = r.token0.lower(), r.token1.lower()
+                if tl in (t0, t1):
+                    other = t1 if tl == t0 else t0
+                    if other in good:
+                        cands.append((t, r.pool, other, tl == t0, int(r.tick_spacing)))
+        bals = self.rpc.multicall([(o, encode_call(self.w3, bal_abi, "balanceOf", [cs(pl)])) for _, pl, o, _, _ in cands], [["uint256"]] * len(cands))
+        best = {}
+        for (t, pl, o, is0, ts), b in zip(cands, bals):
+            usd = (b[0] if b else 0) / 10 ** tmeta[o]["decimals"] * ref[o].iloc[-1]
+            if usd > best.get(t, (0,))[0]:
+                best[t] = (usd, pl, o, is0, ts)
+        chosen = [(t,) + v[1:] for t, v in best.items() if v[0] >= 1_000]   # ignore pools with < $1k of the priced side
+        log.info("on-chain price history for %d of %d flagged tokens", len(chosen), len(tokens))
+
+        self.block_to_ts(self.head)                                      # make sure the block/time grid exists
+        xs, ys = self._ts_grid
+        blocks = np.rint(np.interp(grid, ys, xs)).astype(int)
+        calls = [(pl, encode_call(self.w3, slot0_abi if ts > 0 else res_abi, "slot0" if ts > 0 else "getReserves", []))
+                 for _, pl, _, _, ts in chosen]
+        types = [slot0 if ts > 0 else ["uint256"] * 3 for *_, ts in chosen]
+
+        def at(b):
+            return self.rpc.multicall(calls, types, block=int(b))
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            snaps = list(ex.map(at, blocks))
+
+        rows = []
+        for j, (t, pl, o, is0, ts) in enumerate(chosen):
+            d_t, d_o = tmeta[t.lower()]["decimals"], tmeta[o]["decimals"]
+            ser = []
+            for k, snap in enumerate(snaps):
+                x = snap[j]
+                px = np.nan
+                if x:
+                    if ts > 0:
+                        p01 = (x[0] / 2 ** 96) ** 2                      # raw token1 per raw token0
+                        raw = p01 if is0 else (1 / p01 if p01 > 0 else np.nan)
                     else:
-                        c = w3.eth.contract(address=cs(pool.pool), abi=res_abi)
-                        r0, r1 = self.rpc.call(lambda w3: c.functions.getReserves().call())[:2]
-                        if r0 == 0 or r1 == 0:
-                            continue
-                        px_t_in_other = (r1 / 10 ** d_o) / (r0 / 10 ** d_t) if is0 else (r0 / 10 ** d_o) / (r1 / 10 ** d_t)
-                    px = px_t_in_other * last_px[other]
-                    if 0 < px < 1e7:  # absurd spot = empty / broken pool
-                        rows.append(dict(token=t, ts=LAUNCH_TS, price=px, symbol=tmeta[t]["symbol"], decimals=d_t, source="pool_spot"))
-                        break
-                except Exception as e:  # noqa: BLE001
-                    log.debug("spot price %s via %s failed: %s", t, pool.pool, e)
-        log.info("pool-spot priced %d of %d tokens missing from DefiLlama", len(rows), len(missing))
+                        r0, r1 = x[0], x[1]
+                        raw = (r1 / r0 if is0 else r0 / r1) if r0 > 0 and r1 > 0 else np.nan
+                    px = raw * 10 ** (d_t - d_o) * ref[o].iloc[k]
+                ser.append(px)
+            ser = pd.Series(ser, index=grid).where(lambda v: (v > 0) & (v < 1e7)).rolling(3, min_periods=1, center=True).median()
+            for h, px in ser.dropna().items():
+                rows.append(dict(token=t, ts=h, price=px, symbol=tmeta[t.lower()]["symbol"], decimals=d_t, source="onchain"))
         return pd.DataFrame(rows)
 
 
@@ -321,6 +373,12 @@ def main():
         else:
             df = f.fetch_fee_events(meta)
         df.to_csv(fp, index=False)
+    if st == "onchain-prices":
+        # rebuild on-chain series for unreliable tokens, keeping the stored DefiLlama data
+        pp = os.path.join(DATA, "prices.csv")
+        old = pd.read_csv(pp)
+        toks = sorted(set(meta.token0) | set(meta.token1) | {AERO_TOKEN} | set(pd.read_csv(os.path.join(DATA, "incentives.csv")).token))
+        f.add_onchain(old, toks).to_csv(pp, index=False)
     if st == "repair-ts":
         fp = os.path.join(DATA, "fee_events.csv")
         f.repair_fee_ts(pd.read_csv(fp)).to_csv(fp, index=False)

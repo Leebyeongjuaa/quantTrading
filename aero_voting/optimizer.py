@@ -153,17 +153,20 @@ class Result:
     tx: int
     forecast_usd: float
     log: pd.DataFrame
+    by_gauge: pd.Series
 
 
 def simulate(cube: Cube, fc: Forecaster, aero_px: np.ndarray, p: Params, amount: float, slices: int,
              h_start: int, h_end: int, mode: str = "forecast", gas_usd: float = 0.02) -> Result:
-    """mode: 'forecast' (live bot), 'oracle' (perfect foresight, same constraints), 'market' (pro-rata to supply)."""
+    """mode: 'forecast' (live bot), 'oracle' (perfect foresight, same constraints), 'market' (pro-rata to supply),
+    'top5' (previous heuristic: equal split over the five best trailing-7d earners for this slice)."""
     G = len(cube.gauges)
     A = amount / slices
     alloc = np.zeros((slices, G))
     next_dec = [h_start + round(k * p.horizon_h / slices) for k in range(slices)]
     prev_total = np.zeros(G)
     hourly = np.zeros(h_end - h_start)
+    by_gauge = np.zeros(G)
     tx, fcast, log = 0, 0.0, []
     for h in range(h_start, h_end):
         changed = False
@@ -173,6 +176,11 @@ def simulate(cube: Cube, fc: Forecaster, aero_px: np.ndarray, p: Params, amount:
                 if mode == "market":
                     S = cube.supply[:, h - 1]
                     new = A * S / S.sum()
+                elif mode == "top5":
+                    with np.errstate(divide="ignore", invalid="ignore"):
+                        rate = (cube.reward[:, h - 168:h] * (A / (cube.supply[:, h - 168:h] + A))).mean(axis=1)
+                    new = np.zeros(G)
+                    new[np.argsort(-rate)[:5]] = A / 5
                 else:
                     F, S = fc.forecast(h, p) if mode == "forecast" else fc.realised(h, p)
                     new = allocate(F, S, b, A, p)
@@ -191,18 +199,21 @@ def simulate(cube: Cube, fc: Forecaster, aero_px: np.ndarray, p: Params, amount:
         eff = np.minimum(total, prev_total) if changed else total
         with np.errstate(divide="ignore", invalid="ignore"):
             share = np.where(eff > 0, eff / (cube.supply[:, h] + total), 0.0)
-        hourly[h - h_start] = float((cube.reward[:, h] * share).sum())
+        e = cube.reward[:, h] * share
+        by_gauge += e
+        hourly[h - h_start] = float(e.sum())
         prev_total = total
     gas = tx * gas_usd
     hourly[0] -= gas
     yld = hourly / (amount * aero_px[h_start:h_end])           # hourly yield on the AERO value of the capital
     days = pd.Series(yld, index=pd.to_datetime(cube.hours[h_start:h_end], unit="s")).resample("1D").mean() * 8760 * 100
     return Result(usd=float(hourly.sum()), gas=gas, apr=float(yld.mean() * 8760 * 100), daily_apr=days, tx=tx,
-                  forecast_usd=fcast, log=pd.DataFrame(log))
+                  forecast_usd=fcast, log=pd.DataFrame(log),
+                  by_gauge=pd.Series(by_gauge, index=cube.gauges_label).sort_values(ascending=False))
 
 
 # ----------------------------------------------------------------------------- tuning / reporting
-GRID = dict(lookback_days=[3, 7], recency=[0.0, 0.5], risk=[0.0, 0.5, 1.0], max_share=[0.25, 0.5])
+GRID = dict(lookback_days=[2, 3, 5, 7], recency=[0.0, 0.5], risk=[0.0, 0.5, 1.0], max_share=[0.15, 0.25, 0.5])
 
 
 def tune(cube, fc, px, amount, slices, h0, h1, base: Params):
@@ -266,8 +277,8 @@ def main():
     test_all = [simulate(cube, fc, px, replace(base, **{k: (int(r[k]) if k == 'lookback_days' else r[k]) for k in GRID}),
                          args.amount, args.slices, mid, n).apr for _, r in grid.iterrows()]
     res = {}
-    for name, mode, p in [("optimizer (frozen params)", "forecast", best), ("market average", "market", best),
-                          ("perfect foresight, same constraints", "oracle", best)]:
+    for name, mode, p in [("optimizer (frozen params)", "forecast", best), ("previous heuristic: top-5 equal", "top5", best),
+                          ("market average", "market", best), ("perfect foresight, same constraints", "oracle", best)]:
         res[name] = simulate(cube, fc, px, p, args.amount, args.slices, mid, n, mode=mode)
     single = simulate(cube, fc, px, best, args.amount, 1, mid, n)
     big = simulate(cube, fc, px, best, args.amount * 10, args.slices, mid, n)
@@ -283,6 +294,10 @@ def main():
     say(f"all {len(grid)} parameter sets on the test half: median {np.median(test_all):.1f}%, "
         f"min {np.min(test_all):.1f}%, max {np.max(test_all):.1f}%")
     say(f"1 position instead of {args.slices}: {single.apr:.1f}%   |   {args.amount * 10:,.0f} sAERO: optimizer {big.apr:.1f}% vs market {big_mkt.apr:.1f}%")
+    bg = o.by_gauge[o.by_gauge > 0]
+    say(f"\n## Where the optimizer's test-half earnings came from ({len(bg)} gauges used)")
+    say(pd.DataFrame({"usd": bg.head(10), "share": bg.head(10) / bg.sum()}).to_markdown(floatfmt=",.2f"))
+    say(f"top 3 gauges = {bg.head(3).sum() / bg.sum():.0%} of earnings")
     say("\n## Daily APR on the test half (optimizer vs market)")
     say(pd.DataFrame({"optimizer": o.daily_apr, "market": res["market average"].daily_apr}).rename(
         index=lambda d: d.strftime("%m-%d")).to_markdown(floatfmt=".1f"))
