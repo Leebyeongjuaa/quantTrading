@@ -224,27 +224,32 @@ class Fetcher:
     # ---------------------------------------------------------------- prices
     def fetch_prices(self, tokens: list[str]) -> pd.DataFrame:
         rows = []
-        span = (self.head_ts - LAUNCH_TS) // 3600 + 2
         for t in tokens:
             key = PRICE_PROXY.get(t.lower(), f"base:{t}")
-            url = f"https://coins.llama.fi/chart/{key}?start={LAUNCH_TS - 3600}&span={span}&period=1h"
-            for attempt in range(4):
-                try:
-                    j = requests.get(url, timeout=60).json()
-                    break
-                except Exception as e:  # noqa: BLE001
-                    log.warning("price fetch %s failed: %s", t, e)
-                    time.sleep(3 * (attempt + 1))
-            else:
-                continue
-            coin = j.get("coins", {}).get(key)
-            if not coin:
+            meta = None
+            # DefiLlama returns at most 500 points per request: walk the range in 500-hour chunks
+            for start in range(LAUNCH_TS - 3600, self.head_ts + 3600, 500 * 3600):
+                n = min(500, (self.head_ts + 3600 - start) // 3600 + 1)
+                url = f"https://coins.llama.fi/chart/{key}?start={start}&span={n}&period=1h"
+                j = None
+                for attempt in range(4):
+                    try:
+                        j = requests.get(url, timeout=60).json()
+                        break
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("price fetch %s failed: %s", t, e)
+                        time.sleep(3 * (attempt + 1))
+                coin = (j or {}).get("coins", {}).get(key)
+                if not coin:
+                    continue
+                meta = coin
+                for p in coin["prices"]:
+                    rows.append(dict(token=t, ts=p["timestamp"], price=p["price"], symbol=coin.get("symbol"), decimals=coin.get("decimals")))
+                time.sleep(0.3)
+            if meta is None:
                 log.warning("no llama price for %s", t)
-                continue
-            for p in coin["prices"]:
-                rows.append(dict(token=t, ts=p["timestamp"], price=p["price"], symbol=coin.get("symbol"), decimals=coin.get("decimals")))
-            time.sleep(0.3)
-        df = pd.DataFrame(rows)
+        df = pd.DataFrame(rows, columns=["token", "ts", "price", "symbol", "decimals"])
+        df = df.drop_duplicates(["token", "ts"])
         missing = [t for t in tokens if t not in set(df.token)]
         spot = self.pool_spot_prices(missing, df)
         if len(spot):
