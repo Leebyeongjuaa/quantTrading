@@ -25,7 +25,6 @@ from snapshots import ORACLE, POOL, WETH
 
 URLS = ["https://rpc.mevblocker.io", "https://gateway.tenderly.co/public/mainnet", "https://eth.drpc.org"]
 TRACE_URL = "https://eth.drpc.org"
-ADDRESSES_PROVIDER = "0x2f39d218133afab8f2b819b1066c7e434ad94e9e"
 LADDER = [1, 2, 3, 5, 10, 25, 100, 300, 1800, 7200]  # blocks before the liquidation
 FOLLOW_UP = 50  # same account liquidated this recently: the delay is not a fresh opportunity
 TRACE_PER_BUCKET = int(os.environ.get("TRACE_PER_BUCKET", 300))
@@ -93,18 +92,19 @@ def fetch():
         liq[c] = liq[c].astype(float)
 
     assets = sorted(set(liq.collateral) | set(liq.debt))
-    provider = "0x" + batch([eth_call(ADDRESSES_PROVIDER, selector("getPoolDataProvider()"))])[0][-40:]
-    fee_sel = selector("getLiquidationProtocolFee(address)")
-    meta = batch([eth_call(a, "0x313ce567") for a in assets] + [eth_call(provider, fee_sel + word(a)) for a in assets])
-    decimals = {a: int(r, 16) for a, r in zip(assets, meta)}
-    protocol_fee = {a: int(r, 16) / 1e4 if r and len(r) > 2 else 0.0 for a, r in zip(assets, meta[len(assets):])}
+    decimals = {a: int(r, 16) for a, r in zip(assets, batch([eth_call(a, "0x313ce567") for a in assets]))}
 
     pairs = sorted(set(zip(liq.collateral, liq.block)) | set(zip(liq.debt, liq.block)) | {(WETH, b) for b in liq.block})
     res = batch([eth_call(ORACLE, "0xb3596f07" + word(a), b) for a, b in pairs], label="prices")  # getAssetPrice
     price = {k: int(r, 16) / 1e8 for k, r in zip(pairs, res)}
     liq["debt_usd"] = [d / 10 ** decimals[a] * price[(a, b)] for a, b, d in zip(liq.debt, liq.block, liq.debt_to_cover)]
     liq["collateral_usd"] = [c / 10 ** decimals[a] * price[(a, b)] for a, b, c in zip(liq.collateral, liq.block, liq.collateral_amount)]
-    liq["bonus_usd"] = (liq.collateral_usd - liq.debt_usd) * (1 - liq.collateral.map(protocol_fee))
+    # the protocol keeps part of the bonus: bits 152-167 of the collateral's reserve configuration
+    config = selector("getConfiguration(address)")
+    seized = sorted(set(zip(liq.collateral, liq.block)))
+    res = batch([eth_call(POOL, config + word(a), b) for a, b in seized], label="protocol fee")
+    fee = {k: ((int(r, 16) >> 152) & 0xFFFF) / 1e4 for k, r in zip(seized, res)}
+    liq["bonus_usd"] = (liq.collateral_usd - liq.debt_usd) * (1 - pd.Series([fee[k] for k in zip(liq.collateral, liq.block)]))
 
     liq = liq.sort_values(["block", "tx_index", "log_index"]).reset_index(drop=True)
     previous = liq.groupby("user").block.shift()
@@ -136,8 +136,9 @@ def fetch():
     # direct payments to the builder, from traces, for a sample of each size bucket
     sample = tx.groupby("bucket", observed=True, group_keys=False).apply(
         lambda d: d.sample(min(len(d), TRACE_PER_BUCKET), random_state=0))
-    tx["coinbase_usd"] = np.nan
-    for n, r in enumerate(sample.itertuples()):
+    old = pd.read_csv("data/competition.csv") if os.path.exists("data/competition.csv") else pd.DataFrame(columns=["tx", "coinbase_usd"])
+    tx["coinbase_usd"] = tx.tx.map(old.dropna(subset=["coinbase_usd"]).set_index("tx").coinbase_usd)  # traced earlier
+    for n, r in enumerate(sample[sample.tx.map(tx.set_index("tx").coinbase_usd).isna()].itertuples()):
         for attempt in range(6):
             try:
                 out = requests.post(TRACE_URL, timeout=120, json={
@@ -158,48 +159,50 @@ def fetch():
 
 def report():
     tx = pd.read_csv("data/competition.csv")
+    odd = tx.bonus_usd > 0.2 * tx.debt_usd + 1  # collateral worth far more than the debt: not a normal liquidation
+    print(f"dropped {odd.sum()} abnormal seizures (bonus ${tx[odd].bonus_usd.sum() / 1e6:.0f}M on ${tx[odd].debt_usd.sum() / 1e3:.0f}k of debt)")
+    tx = tx[~odd].copy()
     tx["bucket"] = pd.Categorical(tx.bucket, LABELS, ordered=True)
-    tx["net_usd"] = tx.bonus_usd - tx.gas_usd
+    tx["builder_usd"] = tx.priority_usd + tx.coinbase_usd  # NaN where the transaction was not traced
+    tx["kept_usd"] = tx.bonus_usd - tx.gas_usd - tx.coinbase_usd
+    tx["timing"] = tx.step.map({1: "same block", 2: "next block"}).fillna("later")
     days = (tx.block.max() - tx.block.min()) * 12 / 86400
     print(f"{len(tx)} liquidation transactions over {days:.0f} days, ${tx.debt_usd.sum() / 1e6:.0f}M repaid")
 
     rows = []
     for b, d in tx.groupby("bucket", observed=True):
-        traced = d[d.coinbase_usd.notna()]
-        paid = traced.priority_usd + traced.coinbase_usd
+        t = d[d.coinbase_usd.notna()]
+        scale = len(d) / len(t) * 365 / days
         rows.append({
             "debt repaid": b, "txs": len(d), "per day": len(d) / days, "bonus $k": d.bonus_usd.sum() / 1e3,
             "median bonus $": d.bonus_usd.median(), "median gas $": d.gas_usd.median(),
-            "gas > bonus %": 100 * (d.net_usd < 0).mean(),
-            "to builder % of bonus": 100 * paid.sum() / traced.bonus_usd.sum(),
-            "median to builder %": 100 * (paid / traced.bonus_usd.clip(lower=1e-9)).median(),
-            "traced": len(traced),
+            "traced": len(t), "to builder % of bonus": 100 * t.builder_usd.sum() / t.bonus_usd.sum(),
+            "kept $k/yr": t.kept_usd.sum() * scale / 1e3, "median kept $": t.kept_usd.median(),
+            "kept >half %": 100 * (t.kept_usd > 0.5 * t.bonus_usd).mean(), "lost money %": 100 * (t.kept_usd < 0).mean(),
         })
-    print("\n== economics by size (bonus is net of the protocol's cut, before swap costs) ==")
+    print("\n== economics by size (bonus net of the protocol's cut at oracle prices, before swap costs) ==")
     print(pd.DataFrame(rows).round(1).to_string(index=False))
 
     fresh = tx[~tx.follow_up]
     rows = []
     for b, d in fresh.groupby("bucket", observed=True):
-        late = d[d.step != 1]
-        rows.append({
-            "debt repaid": b, "txs": len(d), "first block %": 100 * (d.step == 1).mean(),
-            "2-3 blocks %": 100 * d.step.isin([2, 3]).mean(), "4-25 blocks %": 100 * d.step.isin([5, 10, 25]).mean(),
-            "longer %": 100 * (~d.step.isin([1, 2, 3, 5, 10, 25])).mean(),
-            "late: txs": len(late), "late: net $k": late.net_usd.clip(lower=0).sum() / 1e3,
-            "late: median net $": late.net_usd.median(),
-        })
-    print("\n== blocks the account had been liquidatable (first liquidation of an episode) ==")
+        row = {"debt repaid": b, "txs": len(d), "same block %": 100 * (d.step == 1).mean(),
+               "next block %": 100 * (d.step == 2).mean(), "1 block late %": 100 * (d.step == 3).mean(),
+               "2-24 late %": 100 * d.step.isin([5, 10, 25]).mean(), "longer %": 100 * (~d.step.isin([1, 2, 3, 5, 10, 25])).mean()}
+        for timing, t in d[d.coinbase_usd.notna()].groupby("timing"):
+            row[f"builder % ({timing})"] = 100 * t.builder_usd.sum() / t.bonus_usd.sum()
+        rows.append(row)
+    print("\n== how long the account had been liquidatable (first liquidation of an episode) ==")
     print(pd.DataFrame(rows).round(1).to_string(index=False))
 
     rows = []
     for b, d in tx.groupby("bucket", observed=True):
-        share = d.groupby("liquidator").bonus_usd.sum().sort_values(ascending=False) / d.bonus_usd.sum()
-        count = d.liquidator.value_counts(normalize=True)
-        rows.append({"debt repaid": b, "liquidators": d.liquidator.nunique(), "top 1 % of bonus": 100 * share.iloc[0],
-                     "top 3 %": 100 * share.iloc[:3].sum(), "top 10 %": 100 * share.iloc[:10].sum(),
-                     "top 3 % of txs": 100 * count.iloc[:3].sum(),
-                     "with >=10 txs": int((d.liquidator.value_counts() >= 10).sum())})
+        count = d.liquidator.value_counts()
+        kept = d[d.coinbase_usd.notna()].groupby("liquidator").kept_usd.sum().clip(lower=0).sort_values(ascending=False)
+        rows.append({"debt repaid": b, "liquidators": len(count), "with >=10 txs": int((count >= 10).sum()),
+                     "top 3 % of txs": 100 * count.iloc[:3].sum() / len(d),
+                     "top 3 % of kept $": 100 * kept.iloc[:3].sum() / kept.sum(),
+                     "top 10 % of kept $": 100 * kept.iloc[:10].sum() / kept.sum()})
     print("\n== who wins ==")
     print(pd.DataFrame(rows).round(1).to_string(index=False))
 
