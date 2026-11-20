@@ -1,0 +1,33 @@
+[package]
+name = "lighter-engine"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Live trading engine for the Lighter perp DEX: REST/WS client, signer, iceberg and pair executors"
+
+[[bin]]
+name = "lighter-cli"
+path = "src/bin/lighter-cli.rs"
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+chrono.workspace = true
+rust_decimal.workspace = true
+# Pure-Rust port of lighter-go (Poseidon2 / Schnorr over Goldilocks). Used only as the
+# offline signer; REST / WS transport is implemented in this crate.
+lighters = { version = "0.1.1", default-features = false }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+dotenvy = "0.15"
+rand = "0.8"
+
+[dev-dependencies]
+rust_decimal_macros.workspace = true

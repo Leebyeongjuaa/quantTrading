@@ -1,0 +1,8 @@
+/target
+**/*.rs.bk
+.env
+bt-out/
+synthetic/
+*.csv
+!tests/fixtures/*.csv
+tools/go-signer-check/go-signer-check
