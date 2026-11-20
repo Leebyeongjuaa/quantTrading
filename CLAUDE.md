@@ -21,6 +21,7 @@ quantTrading/
         ├── morpho.py               # Morpho Blue: markets, liquidations, daily positions
         ├── fluid.py                # Fluid vaults: liquidations, daily positions
         ├── liquidator_flows.py     # Do liquidators sell seized collateral on a DEX in the same tx?
+        ├── competition.py          # Liquidating ourselves: bonus vs gas/builder tips, delay, who wins, by size
         ├── placebo.py              # Same backtest on fake levels: is the edge liquidation-specific?
         ├── merge_periods.py        # Combine datasets downloaded for different periods
         └── backtest.py             # Short ETH/BTC just above large liquidation prices
