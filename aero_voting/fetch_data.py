@@ -28,6 +28,7 @@ from .rpc import Rpc, encode_call
 
 log = logging.getLogger("aero.fetch")
 DATA = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
+LOG_SPAN = 50_000  # publicnode: max 50k blocks and 10 addresses per eth_getLogs
 NOTIFY_FEES_TOPIC = "0x87e2847214b11ebf92b00367c6c1a37b67c5bab8ff351feec88d712e1775de3a"
 # tokens DefiLlama cannot price by Base address -> proxy coin (new AERO converts 1:1 from old AERO)
 PRICE_PROXY = {
@@ -133,7 +134,7 @@ class Fetcher:
             sub = rewards[a0:a0 + 10]
             f = start
             while f <= self.head:
-                t = min(f + 10_000 - 1, self.head)
+                t = min(f + LOG_SPAN - 1, self.head)
                 jobs.append((sub, f, t))
                 f = t + 1
         log.info("fee log jobs: %d", len(jobs))

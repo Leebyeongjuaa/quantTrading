@@ -42,7 +42,9 @@ def price_lookup(prices: pd.DataFrame, hours: np.ndarray) -> pd.DataFrame:
     return tab.loc[hours]
 
 
-def build_panel(verbose=True, drop_first_release=True):
+def build_panel(verbose=True, drop_first_release=True, spot_haircut=1.0):
+    """spot_haircut: value fees/incentives paid in tokens that have no external market price (priced only from an
+    Aero pool's spot, see fetch_data.pool_spot_prices) at this fraction, since they are thin and costly to sell."""
     gauges = pd.read_csv(os.path.join(DATA, "gauges.csv"))
     fees = pd.read_csv(os.path.join(DATA, "fee_events.csv"))
     inc = pd.read_csv(os.path.join(DATA, "incentives.csv"))
@@ -52,13 +54,16 @@ def build_panel(verbose=True, drop_first_release=True):
     hours = np.array(sorted(sup.ts.unique()))
     ptab = price_lookup(prices, hours)
     priced = set(ptab.columns)
+    raw = pd.read_csv(os.path.join(DATA, "prices.csv"))
+    spot = set(raw.loc[raw.get("source", pd.Series(dtype=str)) == "pool_spot", "token"].str.lower()) if "source" in raw else set()
+    mult = {t: (spot_haircut if t in spot else 1.0) for t in priced}
 
     def usd(token_series, amount_series, hour_series):
         out = np.zeros(len(token_series))
         toks = token_series.str.lower().values
         for i, (t, a, h) in enumerate(zip(toks, amount_series.values, hour_series.values)):
             if t in priced:
-                out[i] = a * ptab.at[h, t]
+                out[i] = a * ptab.at[h, t] * mult[t]
             else:
                 out[i] = np.nan
         return out
@@ -87,7 +92,7 @@ def build_panel(verbose=True, drop_first_release=True):
         for h in range(h0, h1 + 1, H):
             ov = max(0, min(r.end, h + H) - max(r.start, h))
             if ov > 0 and h in ptab.index:
-                rows.append((r.gauge, h, r.per_sec_f * ov * ptab.at[h, tok]))
+                rows.append((r.gauge, h, r.per_sec_f * ov * ptab.at[h, tok] * mult[tok]))
     inc_h = pd.DataFrame(rows, columns=["gauge", "hour", "inc_usd"]).groupby(["gauge", "hour"]).inc_usd.sum().reset_index()
 
     panel = sup.rename(columns={"ts": "hour"}).merge(fee_h, how="left", on=["gauge", "hour"]).merge(inc_h, how="left", on=["gauge", "hour"])
@@ -95,6 +100,7 @@ def build_panel(verbose=True, drop_first_release=True):
     panel = panel[panel.hour < hours.max()]  # drop the partial last hour
     panel = panel.merge(gauges[["gauge", "label", "pool_type"]], on="gauge", how="left")
     aero_px = float(ptab[AERO_TOKEN.lower()].iloc[-1]) if AERO_TOKEN.lower() in priced else np.nan
+    panel.attrs.update(ptab=ptab, price_mult=mult, incentives=inc)
     if verbose:
         print(f"panel: {panel.gauge.nunique()} gauges x {panel.hour.nunique()} hours, "
               f"fees ${panel.fees_usd.sum():,.0f}, incentives ${panel.inc_usd.sum():,.0f}, "
