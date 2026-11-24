@@ -121,7 +121,8 @@ wq-bt ops                                                              # fields 
 Two turnover controls sit between target and held weights: `--trade-distance D` re-trades an
 instrument only after the sum of |returns| since its last trade reaches `D` (a distance gate),
 and `--entry-speed s` moves the held weight only `s` of the way toward the target per trade
-(gradual entry). `grid` sweeps both together with decay.
+(gradual entry), and `--exit-speed r` fades a held weight toward zero by `r` per bar while its
+gate stays closed (0 = hold). `grid` sweeps all three together with decay (`--exits`).
 
 Simulation settings mirror BRAIN: `--delay` (1 = alpha from the previous close), `--decay`
 (linear decay over N bars), `--neutralization market|none`, `--truncation` (max |weight| as a

@@ -50,6 +50,9 @@ pub struct Settings {
     /// Entry speed: when a trade is allowed, move this fraction of the way from the current
     /// weight to the target (1 = jump to target, 0.25 = ease in over ~4 trades).
     pub entry_speed: f64,
+    /// While the distance gate stays closed, shrink the held weight toward zero by this
+    /// fraction per bar (0 = hold the position unchanged, 0.1 = fade out over ~10 bars).
+    pub exit_speed: f64,
 }
 
 impl Default for Settings {
@@ -65,6 +68,7 @@ impl Default for Settings {
             cost_bps: 0.0,
             trade_distance: 0.0,
             entry_speed: 1.0,
+            exit_speed: 0.0,
         }
     }
 }
@@ -124,7 +128,9 @@ pub fn weights_from_alpha(alpha: &mut [f64], mask: &[bool], s: &Settings) {
 ///
 /// `dist[i]` accumulates |return| since instrument `i` last traded. An instrument trades when
 /// its distance reaches `trade_distance` (always, when the gate is 0 or the position is flat),
-/// moving `entry_speed` of the way from `prev[i]` to `target[i]`; otherwise it keeps `prev[i]`.
+/// moving `entry_speed` of the way from `prev[i]` to `target[i]`; otherwise it keeps `prev[i]`,
+/// or fades it toward zero by `exit_speed` per bar. Fading does not reset the distance, so the
+/// position re-enters as soon as the price has travelled far enough.
 /// Instruments outside the universe (`mask[i] == false`) are always flattened.
 pub fn gate_weights(
     target: &[f64],
@@ -157,7 +163,8 @@ pub fn gate_weights(
             }
             out.push(w);
         } else {
-            out.push(prev[i]);
+            let fade = s.exit_speed.clamp(0.0, 1.0);
+            out.push(prev[i] * (1.0 - fade));
         }
     }
     out
@@ -348,7 +355,27 @@ mod tests {
             cost_bps: 0.0,
             trade_distance: 0.0,
             entry_speed: 1.0,
+            exit_speed: 0.0,
         }
+    }
+
+    #[test]
+    fn closed_gate_fades_toward_flat() {
+        let mut s = settings();
+        s.trade_distance = 0.05;
+        s.exit_speed = 0.5;
+        let mut dist = vec![0.0];
+        let w1 = gate_weights(&[80.0], &[0.0], &[true], &[0.0], &mut dist, &s);
+        assert_eq!(w1, vec![80.0]);
+        // Gate closed: halve toward zero each bar, distance keeps accumulating.
+        let w2 = gate_weights(&[-80.0], &w1, &[true], &[0.01], &mut dist, &s);
+        assert_eq!(w2, vec![40.0]);
+        let w3 = gate_weights(&[-80.0], &w2, &[true], &[0.01], &mut dist, &s);
+        assert_eq!(w3, vec![20.0]);
+        assert!((dist[0] - 0.02).abs() < 1e-12);
+        // Gate opens: jump to the new target.
+        let w4 = gate_weights(&[-80.0], &w3, &[true], &[0.03], &mut dist, &s);
+        assert_eq!(w4, vec![-80.0]);
     }
 
     #[test]

@@ -58,6 +58,10 @@ struct SimArgs {
     /// Entry speed: fraction of the way to move toward the target per trade (1 = jump).
     #[arg(long, default_value_t = 1.0)]
     entry_speed: f64,
+    /// While the gate is closed, fade the held weight toward zero by this fraction per bar
+    /// (0 = hold).
+    #[arg(long, default_value_t = 0.0)]
+    exit_speed: f64,
 }
 
 impl SimArgs {
@@ -73,6 +77,7 @@ impl SimArgs {
             cost_bps: self.cost_bps,
             trade_distance: self.trade_distance,
             entry_speed: self.entry_speed,
+            exit_speed: self.exit_speed,
         }
     }
 }
@@ -121,6 +126,9 @@ enum Cmd {
         /// Linear decay windows.
         #[arg(long, value_delimiter = ',', default_value = "0,4")]
         decays: Vec<usize>,
+        /// Exit (fade-out) speeds while the gate is closed.
+        #[arg(long, value_delimiter = ',', default_value = "0")]
+        exits: Vec<f64>,
         /// Sort key: fitness, sharpe, return, margin.
         #[arg(long, default_value = "fitness")]
         sort: String,
@@ -318,6 +326,7 @@ fn main() -> Result<()> {
             distances,
             speeds,
             decays,
+            exits,
             sort,
         } => {
             let panel = load(&data)?;
@@ -326,13 +335,18 @@ fn main() -> Result<()> {
             for &decay in &decays {
                 for &d in &distances {
                     for &sp in &speeds {
-                        let mut s = base.clone();
-                        s.decay = decay;
-                        s.trade_distance = d;
-                        s.entry_speed = sp;
-                        match run_alpha(&panel, &alpha, &s) {
-                            Ok((_, m)) => rows.push((decay, d, sp, m)),
-                            Err(e) => eprintln!("skip decay={decay} dist={d} speed={sp}: {e:#}"),
+                        for &ex in &exits {
+                            let mut s = base.clone();
+                            s.decay = decay;
+                            s.trade_distance = d;
+                            s.entry_speed = sp;
+                            s.exit_speed = ex;
+                            match run_alpha(&panel, &alpha, &s) {
+                                Ok((_, m)) => rows.push((decay, d, sp, ex, m)),
+                                Err(e) => eprintln!(
+                                    "skip decay={decay} dist={d} speed={sp} exit={ex}: {e:#}"
+                                ),
+                            }
                         }
                     }
                 }
@@ -344,8 +358,8 @@ fn main() -> Result<()> {
                 _ => m.fitness,
             };
             rows.sort_by(|a, b| {
-                key(&b.3)
-                    .partial_cmp(&key(&a.3))
+                key(&b.4)
+                    .partial_cmp(&key(&a.4))
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
             println!(
@@ -353,10 +367,11 @@ fn main() -> Result<()> {
                 base.cost_bps
             );
             println!(
-                "{:>5} {:>7} {:>6} {:>8} {:>8} {:>8} {:>8} {:>8} {:>7} {:>7}",
+                "{:>5} {:>7} {:>6} {:>5} {:>8} {:>8} {:>8} {:>8} {:>8} {:>7} {:>7}",
                 "decay",
                 "dist",
                 "speed",
+                "exit",
                 "fitness",
                 "sharpe",
                 "ret%",
@@ -365,12 +380,13 @@ fn main() -> Result<()> {
                 "maxdd%",
                 "IC"
             );
-            for (decay, d, sp, m) in rows {
+            for (decay, d, sp, ex, m) in rows {
                 println!(
-                    "{:>5} {:>7.3} {:>6.2} {:>8.3} {:>8.3} {:>8.2} {:>8.1} {:>8.2} {:>7.2} {:>7.3}",
+                    "{:>5} {:>7.3} {:>6.2} {:>5.2} {:>8.3} {:>8.3} {:>8.2} {:>8.1} {:>8.2} {:>7.2} {:>7.3}",
                     decay,
                     d,
                     sp,
+                    ex,
                     m.fitness,
                     m.sharpe,
                     m.annual_return * 100.0,
