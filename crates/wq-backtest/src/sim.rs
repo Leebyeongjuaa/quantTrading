@@ -20,6 +20,28 @@ use crate::mat::Mat;
 use crate::ops::{scale_row, truncate_row, ts_decay_linear};
 use crate::panel::Panel;
 
+/// What the distance gate measures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+pub enum DistanceScope {
+    /// One shared gate for the whole book. Independent of the number of instruments.
+    Portfolio,
+    /// A gate per instrument.
+    Instrument,
+}
+
+/// Which distance the gate accumulates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+pub enum GateMode {
+    /// Price travel: cumulative |return| since the last trade (portfolio scope uses the
+    /// cross-sectional mean |return| per bar). Threshold is a return fraction (0.02 = 2%).
+    Price,
+    /// Signal distance: how far the target weights have drifted from the held weights.
+    /// Portfolio scope: `sum|target - held| / booksize` (the turnover a rebalance would cost);
+    /// instrument scope: `|target_i - held_i|` relative to the average absolute weight
+    /// `booksize / n`. Threshold is that fraction (0.5 = rebalance once half the book is stale).
+    Signal,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 pub enum Neutralization {
     None,
@@ -53,6 +75,8 @@ pub struct Settings {
     /// While the distance gate stays closed, shrink the held weight toward zero by this
     /// fraction per bar (0 = hold the position unchanged, 0.1 = fade out over ~10 bars).
     pub exit_speed: f64,
+    pub distance_scope: DistanceScope,
+    pub gate_mode: GateMode,
 }
 
 impl Default for Settings {
@@ -69,6 +93,8 @@ impl Default for Settings {
             trade_distance: 0.0,
             entry_speed: 1.0,
             exit_speed: 0.0,
+            distance_scope: DistanceScope::Portfolio,
+            gate_mode: GateMode::Price,
         }
     }
 }
@@ -124,20 +150,35 @@ pub fn weights_from_alpha(alpha: &mut [f64], mask: &[bool], s: &Settings) {
     }
 }
 
+/// Accumulated price distance since the last trade: per instrument plus one shared value.
+#[derive(Debug, Clone)]
+pub struct GateState {
+    pub per: Vec<f64>,
+    pub all: f64,
+}
+
+impl GateState {
+    pub fn new(n: usize) -> Self {
+        GateState {
+            per: vec![0.0; n],
+            all: 0.0,
+        }
+    }
+}
+
 /// Turns target weights into held weights for one bar.
 ///
-/// `dist[i]` accumulates |return| since instrument `i` last traded. An instrument trades when
-/// its distance reaches `trade_distance` (always, when the gate is 0 or the position is flat),
-/// moving `entry_speed` of the way from `prev[i]` to `target[i]`; otherwise it keeps `prev[i]`,
-/// or fades it toward zero by `exit_speed` per bar. Fading does not reset the distance, so the
-/// position re-enters as soon as the price has travelled far enough.
-/// Instruments outside the universe (`mask[i] == false`) are always flattened.
+/// The gate decides whether a trade is allowed (see [`GateMode`] and [`DistanceScope`]).
+/// When it is open the weight moves `entry_speed` of the way from `prev` to `target` (and a
+/// price-distance gate resets); when it is closed the weight holds, or fades toward zero by
+/// `exit_speed` per bar. With `trade_distance == 0` the gate is always open. Instruments
+/// outside the universe (`mask[i] == false`) are always flattened.
 pub fn gate_weights(
     target: &[f64],
     prev: &[f64],
     mask: &[bool],
     ret_now: &[f64],
-    dist: &mut [f64],
+    state: &mut GateState,
     s: &Settings,
 ) -> Vec<f64> {
     let speed = if s.entry_speed <= 0.0 || s.entry_speed > 1.0 {
@@ -145,27 +186,70 @@ pub fn gate_weights(
     } else {
         s.entry_speed
     };
-    let mut out = Vec::with_capacity(target.len());
-    for i in 0..target.len() {
+    let fade = s.exit_speed.clamp(0.0, 1.0);
+    let n = target.len();
+    let portfolio = s.distance_scope == DistanceScope::Portfolio;
+    let always = s.trade_distance <= 0.0;
+
+    // Price distances: per-instrument |ret| and the universe mean |ret|.
+    let (mut sum, mut cnt) = (0.0, 0usize);
+    for i in 0..n {
         if ret_now[i].is_finite() {
-            dist[i] += ret_now[i].abs();
+            state.per[i] += ret_now[i].abs();
+            if mask[i] {
+                sum += ret_now[i].abs();
+                cnt += 1;
+            }
         }
+    }
+    if cnt > 0 {
+        state.all += sum / cnt as f64;
+    }
+    // Signal distance: pending turnover of the whole book, and the per-name scale.
+    let n_mask = mask.iter().filter(|m| **m).count().max(1);
+    let pending: f64 = (0..n)
+        .filter(|&i| mask[i])
+        .map(|i| (target[i] - prev[i]).abs())
+        .sum::<f64>()
+        / s.booksize;
+    let per_scale = s.booksize / n_mask as f64;
+
+    let book_open = always
+        || match s.gate_mode {
+            GateMode::Price => state.all >= s.trade_distance,
+            GateMode::Signal => pending >= s.trade_distance,
+        };
+
+    let mut out = Vec::with_capacity(n);
+    let mut traded_any = false;
+    for i in 0..n {
         if !mask[i] {
             out.push(0.0);
-            dist[i] = 0.0;
+            state.per[i] = 0.0;
             continue;
         }
-        let open = s.trade_distance <= 0.0 || dist[i] >= s.trade_distance || prev[i] == 0.0;
+        let open = if portfolio {
+            book_open
+        } else {
+            always
+                || match s.gate_mode {
+                    GateMode::Price => state.per[i] >= s.trade_distance || prev[i] == 0.0,
+                    GateMode::Signal => (target[i] - prev[i]).abs() >= s.trade_distance * per_scale,
+                }
+        };
         if open {
             let w = prev[i] + speed * (target[i] - prev[i]);
             if w != prev[i] {
-                dist[i] = 0.0;
+                state.per[i] = 0.0;
+                traded_any = true;
             }
             out.push(w);
         } else {
-            let fade = s.exit_speed.clamp(0.0, 1.0);
             out.push(prev[i] * (1.0 - fade));
         }
+    }
+    if portfolio && book_open && traded_any {
+        state.all = 0.0;
     }
     out
 }
@@ -244,7 +328,7 @@ pub fn simulate(panel: &Panel, alpha: &Mat, s: &Settings) -> SimResult {
         booksize: s.booksize,
     };
     let mut prev: Vec<f64> = vec![0.0; n];
-    let mut dist: Vec<f64> = vec![0.0; n];
+    let mut gate = GateState::new(n);
 
     for ti in 0..t {
         // Alpha row that drives the position held over (ti, ti+1].
@@ -283,7 +367,7 @@ pub fn simulate(panel: &Panel, alpha: &Mat, s: &Settings) -> SimResult {
         );
         weights_from_alpha(&mut row, &mask, s);
         let row = if s.trade_distance > 0.0 || s.entry_speed < 1.0 {
-            gate_weights(&row, &prev, &mask, panel.returns.row(ti), &mut dist, s)
+            gate_weights(&row, &prev, &mask, panel.returns.row(ti), &mut gate, s)
         } else {
             row
         };
@@ -356,7 +440,62 @@ mod tests {
             trade_distance: 0.0,
             entry_speed: 1.0,
             exit_speed: 0.0,
+            distance_scope: DistanceScope::Instrument,
+            gate_mode: GateMode::Price,
         }
+    }
+
+    #[test]
+    fn portfolio_gate_uses_mean_abs_return() {
+        let mut s = settings();
+        s.distance_scope = DistanceScope::Portfolio;
+        s.trade_distance = 0.02;
+        let mask = [true, true, true, true];
+        let mut g = GateState::new(4);
+        let tgt = [25.0, -25.0, 25.0, -25.0];
+        // Mean |ret| = 1% < 2%: nothing trades yet, even from flat.
+        let w1 = gate_weights(
+            &tgt,
+            &[0.0; 4],
+            &mask,
+            &[0.01, 0.01, 0.01, 0.01],
+            &mut g,
+            &s,
+        );
+        assert_eq!(w1, vec![0.0; 4]);
+        assert!((g.all - 0.01).abs() < 1e-12);
+        // One name moves 4%, others 0: mean 1% -> cumulative 2%: whole book trades, reset.
+        let w2 = gate_weights(&tgt, &w1, &mask, &[0.04, 0.0, 0.0, 0.0], &mut g, &s);
+        assert_eq!(w2, tgt.to_vec());
+        assert_eq!(g.all, 0.0);
+        // Doubling the universe with identical returns leaves the mean unchanged.
+        let mut g8 = GateState::new(8);
+        let w = gate_weights(&[10.0; 8], &[0.0; 8], &[true; 8], &[0.02; 8], &mut g8, &s);
+        assert_eq!(w, vec![10.0; 8]);
+    }
+
+    #[test]
+    fn signal_gate_trades_on_pending_turnover() {
+        let mut s = settings();
+        s.gate_mode = GateMode::Signal;
+        s.distance_scope = DistanceScope::Portfolio;
+        s.trade_distance = 0.5; // half the book must be stale
+        let mask = [true, true];
+        let mut g = GateState::new(2);
+        // From flat the pending turnover is 1.0 >= 0.5: trade.
+        let w1 = gate_weights(&[50.0, -50.0], &[0.0, 0.0], &mask, &[0.0, 0.0], &mut g, &s);
+        assert_eq!(w1, vec![50.0, -50.0]);
+        // Target drifts by 20 per name = 40% of the book: hold.
+        let w2 = gate_weights(&[30.0, -70.0], &w1, &mask, &[0.0, 0.0], &mut g, &s);
+        assert_eq!(w2, w1);
+        // Target flips = 200% pending: trade.
+        let w3 = gate_weights(&[-50.0, 50.0], &w2, &mask, &[0.0, 0.0], &mut g, &s);
+        assert_eq!(w3, vec![-50.0, 50.0]);
+        // Instrument scope: threshold relative to booksize / n = 50 per name.
+        s.distance_scope = DistanceScope::Instrument;
+        s.trade_distance = 0.5; // 25 per name
+        let w4 = gate_weights(&[-30.0, 20.0], &w3, &mask, &[0.0, 0.0], &mut g, &s);
+        assert_eq!(w4, vec![-50.0, 20.0]); // first moved 20 (<25): hold; second moved 30: trade
     }
 
     #[test]
@@ -364,7 +503,7 @@ mod tests {
         let mut s = settings();
         s.trade_distance = 0.05;
         s.exit_speed = 0.5;
-        let mut dist = vec![0.0];
+        let mut dist = GateState::new(1);
         let w1 = gate_weights(&[80.0], &[0.0], &[true], &[0.0], &mut dist, &s);
         assert_eq!(w1, vec![80.0]);
         // Gate closed: halve toward zero each bar, distance keeps accumulating.
@@ -372,7 +511,7 @@ mod tests {
         assert_eq!(w2, vec![40.0]);
         let w3 = gate_weights(&[-80.0], &w2, &[true], &[0.01], &mut dist, &s);
         assert_eq!(w3, vec![20.0]);
-        assert!((dist[0] - 0.02).abs() < 1e-12);
+        assert!((dist.per[0] - 0.02).abs() < 1e-12);
         // Gate opens: jump to the new target.
         let w4 = gate_weights(&[-80.0], &w3, &[true], &[0.03], &mut dist, &s);
         assert_eq!(w4, vec![-80.0]);
@@ -383,7 +522,7 @@ mod tests {
         let mut s = settings();
         s.trade_distance = 0.05;
         let mask = [true, true];
-        let mut dist = vec![0.0, 0.0];
+        let mut dist = GateState::new(2);
         // First trade from flat always happens.
         let w1 = gate_weights(
             &[50.0, -50.0],
@@ -400,7 +539,7 @@ mod tests {
         // Cumulative 5%: trade, and the distance resets.
         let w3 = gate_weights(&[-50.0, 50.0], &w2, &mask, &[0.04, 0.04], &mut dist, &s);
         assert_eq!(w3, vec![-50.0, 50.0]);
-        assert_eq!(dist, vec![0.0, 0.0]);
+        assert_eq!(dist.per, vec![0.0, 0.0]);
         // Leaving the universe flattens regardless of the gate.
         let w4 = gate_weights(
             &[0.0, 50.0],
@@ -417,7 +556,7 @@ mod tests {
     fn entry_speed_eases_in() {
         let mut s = settings();
         s.entry_speed = 0.5;
-        let mut dist = vec![0.0];
+        let mut dist = GateState::new(1);
         let w1 = gate_weights(&[100.0], &[0.0], &[true], &[0.0], &mut dist, &s);
         assert_eq!(w1, vec![50.0]);
         let w2 = gate_weights(&[100.0], &w1, &[true], &[0.0], &mut dist, &s);

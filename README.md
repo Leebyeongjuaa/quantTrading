@@ -125,7 +125,10 @@ Two turnover controls sit between target and held weights: `--trade-distance D` 
 instrument only after the sum of |returns| since its last trade reaches `D` (a distance gate),
 and `--entry-speed s` moves the held weight only `s` of the way toward the target per trade
 (gradual entry), and `--exit-speed r` fades a held weight toward zero by `r` per bar while its
-gate stays closed (0 = hold). `grid` sweeps all three together with decay (`--exits`).
+gate stays closed (0 = hold). The gate measures either price travel (`--gate price`: cumulative
+|return|, the universe mean per bar under `--distance-scope portfolio`, so it does not change
+with the number of instruments) or signal drift (`--gate signal`: pending turnover
+`sum|target - held| / booksize`). `grid` sweeps distance × speed × exit with decay.
 
 Simulation settings mirror BRAIN: `--delay` (1 = alpha from the previous close), `--decay`
 (linear decay over N bars), `--neutralization market|none`, `--truncation` (max |weight| as a

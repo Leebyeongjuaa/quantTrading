@@ -5,7 +5,10 @@ use std::path::PathBuf;
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use wq_backtest::ops::OPERATORS;
-use wq_backtest::{evaluate, parse, simulate, Metrics, Neutralization, Panel, Settings, SimResult};
+use wq_backtest::{
+    evaluate, parse, simulate, DistanceScope, GateMode, Metrics, Neutralization, Panel, Settings,
+    SimResult,
+};
 
 #[derive(Parser)]
 #[command(
@@ -62,6 +65,13 @@ struct SimArgs {
     /// (0 = hold).
     #[arg(long, default_value_t = 0.0)]
     exit_speed: f64,
+    /// `portfolio`: one gate for the book (size-invariant); `instrument`: a gate per name.
+    #[arg(long, value_enum, default_value = "portfolio")]
+    distance_scope: DistanceScope,
+    /// `price`: cumulative |return| (mean over the universe for portfolio scope);
+    /// `signal`: pending turnover sum|target - held| / booksize.
+    #[arg(long, value_enum, default_value = "price")]
+    gate: GateMode,
 }
 
 impl SimArgs {
@@ -78,6 +88,8 @@ impl SimArgs {
             trade_distance: self.trade_distance,
             entry_speed: self.entry_speed,
             exit_speed: self.exit_speed,
+            distance_scope: self.distance_scope,
+            gate_mode: self.gate,
         }
     }
 }
@@ -363,8 +375,8 @@ fn main() -> Result<()> {
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
             println!(
-                "alpha: {alpha}   cost {} bps   sorted by {sort}",
-                base.cost_bps
+                "alpha: {alpha}   cost {} bps   gate {:?}/{:?}   sorted by {sort}",
+                base.cost_bps, base.gate_mode, base.distance_scope
             );
             println!(
                 "{:>5} {:>7} {:>6} {:>5} {:>8} {:>8} {:>8} {:>8} {:>8} {:>7} {:>7}",
