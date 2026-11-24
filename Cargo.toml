@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/lighter-engine", "crates/statarb-backtest"]
+members = ["crates/lighter-engine", "crates/statarb-backtest", "crates/wq-backtest"]
 
 [workspace.package]
 edition = "2021"

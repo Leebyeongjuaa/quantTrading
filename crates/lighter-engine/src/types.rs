@@ -116,6 +116,8 @@ pub struct MarketInfo {
     pub index_price: Option<Decimal>,
     #[serde(default)]
     pub is_frozen: bool,
+    #[serde(default, rename = "daily_quote_token_volume")]
+    pub daily_quote_volume: f64,
 }
 
 impl MarketInfo {

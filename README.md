@@ -6,6 +6,7 @@ Rust workspace with two independent crates:
 |---|---|---|
 | `crates/lighter-engine` | `lighter-cli` | Live trading engine for the [Lighter](https://lighter.xyz) perp DEX: signer, REST, WebSocket, order gateway, iceberg and pair executors |
 | `crates/statarb-backtest` | `statarb-bt` | Event-driven pairs / stat-arb backtester for 10-minute bars (any fixed interval works) |
+| `crates/wq-backtest` | `wq-bt` | WorldQuant-BRAIN-style cross-sectional alpha backtester: expression language, decay / neutralization / truncation, Sharpe / turnover / fitness / margin |
 
 `tools/go-signer-check` is a small Go program that cross-checks the Rust signer against Lighter's
 official `lighter-go` reference implementation.
@@ -97,6 +98,40 @@ The z-score of the spread over `lookback` drives entries (`|z| >= entry_z`), exi
 slippage; fees are charged per leg per side. Leg A trades `notional`; leg B trades
 `notional * beta` (dollar-neutral hedge in log space). Outputs: `equity.csv`, `trades.csv`,
 `summary.json` with Sharpe, Sortino, max drawdown, win rate, profit factor, exposure.
+
+## Cross-sectional alpha backtester (WorldQuant BRAIN style)
+
+An alpha is an expression evaluated on a panel of instruments × bars. Each bar the vector of
+alpha values becomes dollar-neutral long/short weights and earns the next bar's returns.
+
+```bash
+# 1. data: one CSV per instrument in a directory
+lighter-cli candles-universe --top 20 --resolution 1h --days 90 --out-dir data/
+
+# 2. simulate
+wq-bt info --data-dir data/
+wq-bt run "rank(-ts_delta(close, 5))" --data-dir data/ --delay 1 --decay 4 --truncation 0.1 --out wq-out
+wq-bt run "-ts_corr(rank(close), rank(volume), 24)" --data-dir data/ --bar 4h --universe 10 --cost-bps 3
+wq-bt batch crates/wq-backtest/alphas.example.txt --data-dir data/     # many alphas, ranked by fitness
+wq-bt corr "rank(-ts_delta(close, 5))" "-ts_rank(returns, 24)" --data-dir data/   # PnL correlation
+wq-bt ops                                                              # fields and operators
+```
+
+Simulation settings mirror BRAIN: `--delay` (1 = alpha from the previous close), `--decay`
+(linear decay over N bars), `--neutralization market|none`, `--truncation` (max |weight| as a
+fraction of the book), `--booksize`, `--universe N` (top-N by trailing dollar volume) and an
+optional `--cost-bps`. Reported: annualized Sharpe, annual return, daily turnover,
+`fitness = sharpe · sqrt(|return| / max(turnover, 0.125))`, margin (bps per dollar traded),
+max drawdown, mean IC / ICIR, long/short counts and a yearly or monthly breakdown. Outputs:
+`pnl.csv`, `weights.csv`, `summary.json`.
+
+Operators (BRAIN names): element-wise `abs log sqrt sign signed_power max min if_else ...`;
+cross-sectional `rank zscore scale normalize winsorize truncate`; time-series `ts_mean ts_sum
+ts_std_dev ts_delta ts_delay ts_returns ts_rank ts_min ts_max ts_arg_max ts_arg_min ts_corr
+ts_covariance ts_decay_linear ts_decay_exp_window ts_zscore ts_scale ts_av_diff ts_product
+ts_backfill hump`; fields `open high low close volume dollar_volume returns vwap adv(d)`.
+Group operators (industry neutralization) are not implemented because the universe has no
+sector data.
 
 ## Verifying the signer against Go
 

@@ -1,0 +1,361 @@
+//! Position construction and PnL simulation, following WorldQuant BRAIN semantics.
+//!
+//! Per bar `t`: alpha vector `a_t` → optional linear decay over `decay` bars → universe mask
+//! (instruments with a valid alpha, a valid next return and, if set, top-`universe` by trailing
+//! dollar volume) → neutralization (market: demean) → scale to `booksize` (sum |w| = booksize)
+//! → truncation (cap |w_i| ≤ truncation · booksize, re-scaled) → weights `w_t`.
+//!
+//! With `delay = 1` the weights at `t` come from the alpha computed at `t-1` (data through the
+//! previous close); `delay = 0` uses the alpha at `t`. Weights `w_t` are held over `(t, t+1]`
+//! and earn `w_t · r_{t+1}`. Turnover at `t` is `sum |w_t - w_{t-1}| / booksize`.
+
+use serde::{Deserialize, Serialize};
+
+use crate::mat::Mat;
+use crate::ops::{scale_row, truncate_row, ts_decay_linear};
+use crate::panel::Panel;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+pub enum Neutralization {
+    None,
+    /// Subtract the cross-sectional mean so longs equal shorts in dollars.
+    Market,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Settings {
+    /// 0 or 1 bars between the alpha's last data point and the position.
+    pub delay: usize,
+    /// Linear decay window in bars (0/1 = none).
+    pub decay: usize,
+    pub neutralization: Neutralization,
+    /// Max |weight| as a fraction of booksize (0 or >=1 disables). BRAIN default 0.1.
+    pub truncation: f64,
+    /// Gross dollar book: sum |w| each bar.
+    pub booksize: f64,
+    /// Instruments per bar, ranked by trailing dollar volume (0 = all).
+    pub universe: usize,
+    /// Trailing window (bars) for the liquidity ranking.
+    pub universe_window: usize,
+    /// Transaction cost per dollar traded, basis points (0 = BRAIN's cost-free PnL).
+    pub cost_bps: f64,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings {
+            delay: 1,
+            decay: 0,
+            neutralization: Neutralization::Market,
+            truncation: 0.1,
+            booksize: 1_000_000.0,
+            universe: 0,
+            universe_window: 20,
+            cost_bps: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SimResult {
+    pub ts: Vec<i64>,
+    /// PnL earned over `(t-1, t]` from weights set at `t-1`, after costs.
+    pub pnl: Vec<f64>,
+    pub gross_pnl: Vec<f64>,
+    pub costs: Vec<f64>,
+    /// `sum |w_t - w_{t-1}| / booksize`.
+    pub turnover: Vec<f64>,
+    pub long_count: Vec<usize>,
+    pub short_count: Vec<usize>,
+    pub long_notional: Vec<f64>,
+    pub short_notional: Vec<f64>,
+    /// Dollars traded at `t`.
+    pub traded: Vec<f64>,
+    /// Spearman IC between the raw alpha used at `t` and `r_{t+1}`.
+    pub ic: Vec<f64>,
+    pub weights: Mat,
+    pub settings: Settings,
+    pub booksize: f64,
+}
+
+/// Builds the weight row from an alpha row (in place): mask → neutralize → scale → truncate.
+pub fn weights_from_alpha(alpha: &mut [f64], mask: &[bool], s: &Settings) {
+    for (a, m) in alpha.iter_mut().zip(mask) {
+        if !*m {
+            *a = f64::NAN;
+        }
+    }
+    if s.neutralization == Neutralization::Market {
+        let v: Vec<f64> = alpha.iter().copied().filter(|x| x.is_finite()).collect();
+        if !v.is_empty() {
+            let mu = v.iter().sum::<f64>() / v.len() as f64;
+            for a in alpha.iter_mut() {
+                if a.is_finite() {
+                    *a -= mu;
+                }
+            }
+        }
+    }
+    scale_row(alpha, s.booksize);
+    if s.truncation > 0.0 && s.truncation < 1.0 {
+        truncate_row(alpha, s.truncation);
+    }
+    for a in alpha.iter_mut() {
+        if !a.is_finite() {
+            *a = 0.0;
+        }
+    }
+}
+
+fn spearman(a: &[f64], b: &[f64]) -> f64 {
+    let mut ra: Vec<f64> = Vec::new();
+    let mut rb: Vec<f64> = Vec::new();
+    for (x, y) in a.iter().zip(b) {
+        if x.is_finite() && y.is_finite() {
+            ra.push(*x);
+            rb.push(*y);
+        }
+    }
+    if ra.len() < 3 {
+        return f64::NAN;
+    }
+    crate::ops::rank_row(&mut ra);
+    crate::ops::rank_row(&mut rb);
+    let n = ra.len() as f64;
+    let (ma, mb) = (ra.iter().sum::<f64>() / n, rb.iter().sum::<f64>() / n);
+    let (mut sxy, mut sxx, mut syy) = (0.0, 0.0, 0.0);
+    for (x, y) in ra.iter().zip(&rb) {
+        sxy += (x - ma) * (y - mb);
+        sxx += (x - ma).powi(2);
+        syy += (y - mb).powi(2);
+    }
+    if sxx > 0.0 && syy > 0.0 {
+        sxy / (sxx * syy).sqrt()
+    } else {
+        f64::NAN
+    }
+}
+
+pub fn simulate(panel: &Panel, alpha: &Mat, s: &Settings) -> SimResult {
+    let (t, n) = (panel.t(), panel.n());
+    assert_eq!((alpha.t, alpha.n), (t, n), "alpha shape must match panel");
+    let decayed = if s.decay > 1 {
+        ts_decay_linear(alpha, s.decay)
+    } else {
+        alpha.clone()
+    };
+    let liquidity = if s.universe > 0 {
+        Some(
+            crate::ops::evaluate(
+                panel,
+                &crate::expr::Expr::Call {
+                    name: "ts_mean".into(),
+                    args: vec![
+                        crate::expr::Expr::Ident("dollar_volume".into()),
+                        crate::expr::Expr::Num(s.universe_window as f64),
+                    ],
+                    kwargs: vec![],
+                },
+            )
+            .expect("ts_mean"),
+        )
+    } else {
+        None
+    };
+
+    let mut weights = Mat::filled(t, n, 0.0);
+    let mut res = SimResult {
+        ts: panel.ts.clone(),
+        pnl: vec![0.0; t],
+        gross_pnl: vec![0.0; t],
+        costs: vec![0.0; t],
+        turnover: vec![0.0; t],
+        long_count: vec![0; t],
+        short_count: vec![0; t],
+        long_notional: vec![0.0; t],
+        short_notional: vec![0.0; t],
+        traded: vec![0.0; t],
+        ic: vec![f64::NAN; t],
+        weights: Mat::filled(0, 0, 0.0),
+        settings: s.clone(),
+        booksize: s.booksize,
+    };
+    let mut prev: Vec<f64> = vec![0.0; n];
+
+    for ti in 0..t {
+        // Alpha row that drives the position held over (ti, ti+1].
+        let src = match ti.checked_sub(s.delay) {
+            Some(src) => src,
+            None => continue,
+        };
+        let mut row: Vec<f64> = decayed.row(src).to_vec();
+        // Universe: needs a tradeable next return (we must be able to hold the instrument).
+        let next_ret: Vec<f64> = if ti + 1 < t {
+            panel.returns.row(ti + 1).to_vec()
+        } else {
+            vec![f64::NAN; n]
+        };
+        let mut mask: Vec<bool> = (0..n)
+            .map(|i| row[i].is_finite() && panel.close.get(ti, i).is_finite())
+            .collect();
+        if let Some(liq) = &liquidity {
+            let mut ranked: Vec<(usize, f64)> = (0..n)
+                .filter(|&i| mask[i] && liq.get(src, i).is_finite())
+                .map(|i| (i, liq.get(src, i)))
+                .collect();
+            ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            let keep: std::collections::HashSet<usize> =
+                ranked.iter().take(s.universe).map(|x| x.0).collect();
+            for (i, m) in mask.iter_mut().enumerate() {
+                *m = keep.contains(&i);
+            }
+        }
+        res.ic[ti] = spearman(
+            &row.iter()
+                .zip(&mask)
+                .map(|(v, m)| if *m { *v } else { f64::NAN })
+                .collect::<Vec<_>>(),
+            &next_ret,
+        );
+        weights_from_alpha(&mut row, &mask, s);
+
+        let traded: f64 = row.iter().zip(&prev).map(|(w, p)| (w - p).abs()).sum();
+        res.traded[ti] = traded;
+        res.turnover[ti] = traded / s.booksize;
+        res.costs[ti] = traded * s.cost_bps / 10_000.0;
+        res.long_count[ti] = row.iter().filter(|w| **w > 0.0).count();
+        res.short_count[ti] = row.iter().filter(|w| **w < 0.0).count();
+        res.long_notional[ti] = row.iter().filter(|w| **w > 0.0).sum();
+        res.short_notional[ti] = row.iter().filter(|w| **w < 0.0).map(|w| -w).sum();
+        // Costs are paid when trading at ti; PnL from these weights lands at ti+1.
+        res.pnl[ti] -= res.costs[ti];
+        if ti + 1 < t {
+            let gross: f64 = row
+                .iter()
+                .zip(&next_ret)
+                .map(|(w, r)| if r.is_finite() { w * r } else { 0.0 })
+                .sum();
+            res.gross_pnl[ti + 1] += gross;
+            res.pnl[ti + 1] += gross;
+        }
+        weights.row_mut(ti).copy_from_slice(&row);
+        prev = row;
+    }
+    res.weights = weights;
+    res
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::expr::parse;
+    use crate::ops::evaluate;
+    use crate::panel::tests::bars;
+
+    fn panel() -> Panel {
+        Panel::from_series(vec![
+            (
+                "A".into(),
+                bars(0, &[10.0, 11.0, 12.0, 11.0, 13.0, 14.0, 13.0, 15.0]),
+            ),
+            (
+                "B".into(),
+                bars(0, &[50.0, 49.0, 48.0, 50.0, 47.0, 46.0, 48.0, 45.0]),
+            ),
+            (
+                "C".into(),
+                bars(0, &[5.0, 5.0, 5.5, 6.0, 6.0, 7.0, 6.5, 7.0]),
+            ),
+            (
+                "D".into(),
+                bars(0, &[1.0, 1.1, 1.0, 1.2, 1.1, 1.3, 1.2, 1.4]),
+            ),
+        ])
+        .unwrap()
+    }
+
+    fn settings() -> Settings {
+        Settings {
+            delay: 0,
+            decay: 0,
+            neutralization: Neutralization::Market,
+            truncation: 0.0,
+            booksize: 100.0,
+            universe: 0,
+            universe_window: 2,
+            cost_bps: 0.0,
+        }
+    }
+
+    #[test]
+    fn weights_are_neutral_and_scaled() {
+        let mut row = vec![3.0, 1.0, f64::NAN, 2.0];
+        weights_from_alpha(&mut row, &[true, true, true, true], &settings());
+        assert!((row.iter().sum::<f64>()).abs() < 1e-9);
+        assert!((row.iter().map(|v| v.abs()).sum::<f64>() - 100.0).abs() < 1e-9);
+        assert_eq!(row[2], 0.0);
+        let mut s = settings();
+        s.truncation = 0.3;
+        let mut row = vec![10.0, 0.0, 0.0, -1.0];
+        weights_from_alpha(&mut row, &[true; 4], &s);
+        assert!(row.iter().all(|w| w.abs() <= 30.0 + 1e-6));
+        assert!((row.iter().map(|v| v.abs()).sum::<f64>() - 100.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn perfect_foresight_alpha_is_always_profitable() {
+        let p = panel();
+        // Alpha = next bar's return (look-ahead on purpose) with delay 0 must win every bar.
+        let mut a = Mat::nan(p.t(), p.n());
+        for t in 0..p.t() - 1 {
+            for i in 0..p.n() {
+                a.set(t, i, p.returns.get(t + 1, i));
+            }
+        }
+        let r = simulate(&p, &a, &settings());
+        for t in 1..p.t() {
+            assert!(r.pnl[t] > 0.0, "bar {t} pnl {}", r.pnl[t]);
+            assert!((r.ic[t - 1] - 1.0).abs() < 1e-9);
+        }
+        // Same alpha with delay 1 is stale by one bar and no longer perfect.
+        let mut s = settings();
+        s.delay = 1;
+        let r1 = simulate(&p, &a, &s);
+        assert!(r1.pnl.iter().sum::<f64>() < r.pnl.iter().sum::<f64>());
+        assert_eq!(r1.long_count[0], 0); // nothing to trade before the first alpha
+    }
+
+    #[test]
+    fn turnover_costs_and_universe() {
+        let p = panel();
+        let a = evaluate(&p, &parse("-ts_delta(close, 1)").unwrap()).unwrap();
+        let mut s = settings();
+        s.cost_bps = 10.0;
+        let r = simulate(&p, &a, &s);
+        // First trade from flat: turnover = 1 (full book), costs = 100 * 10bps = 0.1.
+        let first = (0..p.t()).find(|&t| r.turnover[t] > 0.0).unwrap();
+        assert!((r.turnover[first] - 1.0).abs() < 1e-9);
+        assert!((r.costs[first] - 0.1).abs() < 1e-9);
+        assert!(r.turnover.iter().all(|x| *x <= 2.0 + 1e-9));
+        s.universe = 2;
+        let r2 = simulate(&p, &a, &s);
+        assert!(r2
+            .long_count
+            .iter()
+            .zip(&r2.short_count)
+            .all(|(l, sh)| l + sh <= 2));
+        assert_eq!(r.weights.t, p.t());
+    }
+
+    #[test]
+    fn decay_smooths_turnover() {
+        let p = panel();
+        let a = evaluate(&p, &parse("-ts_delta(close, 1)").unwrap()).unwrap();
+        let s0 = settings();
+        let mut s4 = settings();
+        s4.decay = 3;
+        let t0: f64 = simulate(&p, &a, &s0).turnover[3..].iter().sum();
+        let t4: f64 = simulate(&p, &a, &s4).turnover[3..].iter().sum();
+        assert!(t4 < t0, "decay should lower turnover: {t4} vs {t0}");
+    }
+}

@@ -1,0 +1,16 @@
+# One alpha per line; `#` starts a comment. Run with:
+#   wq-bt batch crates/wq-backtest/alphas.example.txt --data-dir data/ --delay 1 --decay 4
+# Short-term reversal
+rank(-ts_delta(close, 5))
+-ts_rank(returns, 24)
+# Reversal scaled by relative volume
+rank(-ts_delta(close, 5)) * rank(volume / adv(20))
+# Momentum
+rank(ts_delta(close, 120)) - 0.5
+ts_zscore(close, 48)
+# Volume / price divergence
+-ts_corr(rank(close), rank(volume), 24)
+# Volatility-normalised reversal
+-ts_av_diff(close, 24) / ts_std_dev(returns, 24)
+# Alpha #101-style intraday pressure (close-open over range)
+(close - open) / (high - low + 0.001)

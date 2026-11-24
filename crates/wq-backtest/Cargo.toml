@@ -1,0 +1,20 @@
+[package]
+name = "wq-backtest"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "WorldQuant-BRAIN-style cross-sectional alpha backtester: expression language, decay/neutralization/truncation, Sharpe/turnover/fitness/margin"
+
+[[bin]]
+name = "wq-bt"
+path = "src/bin/wq-bt.rs"
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+chrono.workspace = true
+csv = "1"
+statarb-backtest = { path = "../statarb-backtest" }

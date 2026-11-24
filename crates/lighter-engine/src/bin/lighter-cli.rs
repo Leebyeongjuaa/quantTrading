@@ -55,6 +55,22 @@ enum Cmd {
         #[arg(long)]
         out: std::path::PathBuf,
     },
+    /// Download candles for many markets into a directory (`<SYMBOL>.csv`), for `wq-bt`.
+    CandlesUniverse {
+        /// Symbols to fetch; default = the top N perp markets by daily quote volume.
+        #[arg(long, value_delimiter = ',')]
+        symbols: Vec<String>,
+        #[arg(long, default_value_t = 20)]
+        top: usize,
+        #[arg(long, default_value = "1h")]
+        resolution: String,
+        #[arg(long, default_value_t = 90)]
+        days: u32,
+        #[arg(long)]
+        resample: Option<String>,
+        #[arg(long)]
+        out_dir: std::path::PathBuf,
+    },
     /// Dump raw WebSocket frames for a market (debugging).
     WsDump {
         symbol: String,
@@ -280,6 +296,74 @@ async fn main() -> anyhow::Result<()> {
                 std::fs::File::create(&out).with_context(|| format!("create {}", out.display()))?;
             candles::write_csv(std::io::BufWriter::new(f), &bars)?;
             println!("wrote {} bars to {}", bars.len(), out.display());
+        }
+        Cmd::CandlesUniverse {
+            symbols,
+            top,
+            resolution,
+            days,
+            resample,
+            out_dir,
+        } => {
+            if !lighter_engine::rest::CANDLE_RESOLUTIONS.contains(&resolution.as_str()) {
+                bail!(
+                    "Lighter only serves {:?}; use --resample for others",
+                    lighter_engine::rest::CANDLE_RESOLUTIONS
+                );
+            }
+            let mut markets = rest.order_book_details(None).await?;
+            markets.retain(|m| m.status == "active" && !m.is_frozen);
+            let chosen: Vec<_> = if symbols.is_empty() {
+                markets.sort_by(|a, b| {
+                    b.daily_quote_volume
+                        .partial_cmp(&a.daily_quote_volume)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                markets
+                    .into_iter()
+                    .filter(|m| m.market_type == "perp")
+                    .take(top)
+                    .collect()
+            } else {
+                let catalog = MarketCatalog::from_markets(markets);
+                symbols
+                    .iter()
+                    .map(|s| catalog.get(s).cloned())
+                    .collect::<Result<_, _>>()?
+            };
+            let src_ms =
+                lighter_engine::rest::resolution_ms(&resolution).context("bad resolution")?;
+            let tgt_ms = resample
+                .as_deref()
+                .map(lighter_engine::rest::resolution_ms)
+                .map(|o| o.context("bad --resample"))
+                .transpose()?;
+            if let Some(t) = tgt_ms {
+                if t % src_ms != 0 || t <= src_ms {
+                    bail!("--resample must be a multiple of {resolution}");
+                }
+            }
+            std::fs::create_dir_all(&out_dir)?;
+            let end = chrono::Utc::now().timestamp_millis();
+            let start = end - days as i64 * 86_400_000;
+            for m in chosen {
+                let mut bars = rest
+                    .candles_range(m.market_id, &resolution, start, end)
+                    .await?;
+                if let Some(t) = tgt_ms {
+                    bars = candles::resample(&bars, t);
+                }
+                let path = out_dir.join(format!("{}.csv", m.symbol));
+                let f = std::fs::File::create(&path)
+                    .with_context(|| format!("create {}", path.display()))?;
+                candles::write_csv(std::io::BufWriter::new(f), &bars)?;
+                println!(
+                    "{:<10} {:>6} bars -> {}",
+                    m.symbol,
+                    bars.len(),
+                    path.display()
+                );
+            }
         }
         Cmd::WsDump { symbol, seconds } => {
             let catalog = MarketCatalog::load(&rest).await?;
