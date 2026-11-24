@@ -51,6 +51,13 @@ struct SimArgs {
     /// Cost per dollar traded in bps (0 = cost-free like BRAIN).
     #[arg(long, default_value_t = 0.0)]
     cost_bps: f64,
+    /// Distance gate: re-trade an instrument only after sum|returns| since its last trade
+    /// reaches this fraction (0.02 = 2%). 0 = trade every bar.
+    #[arg(long, default_value_t = 0.0)]
+    trade_distance: f64,
+    /// Entry speed: fraction of the way to move toward the target per trade (1 = jump).
+    #[arg(long, default_value_t = 1.0)]
+    entry_speed: f64,
 }
 
 impl SimArgs {
@@ -64,6 +71,8 @@ impl SimArgs {
             universe: self.universe,
             universe_window: self.universe_window,
             cost_bps: self.cost_bps,
+            trade_distance: self.trade_distance,
+            entry_speed: self.entry_speed,
         }
     }
 }
@@ -90,6 +99,31 @@ enum Cmd {
         data: DataArgs,
         #[command(flatten)]
         sim: SimArgs,
+    },
+    /// Grid over turnover controls (distance gate × entry speed × decay) for one alpha.
+    Grid {
+        #[arg(allow_hyphen_values = true)]
+        alpha: String,
+        #[command(flatten)]
+        data: DataArgs,
+        #[command(flatten)]
+        sim: SimArgs,
+        /// Distance-gate thresholds as fractions.
+        #[arg(
+            long,
+            value_delimiter = ',',
+            default_value = "0,0.005,0.01,0.02,0.03,0.05"
+        )]
+        distances: Vec<f64>,
+        /// Entry speeds in (0, 1].
+        #[arg(long, value_delimiter = ',', default_value = "1,0.5,0.25,0.1")]
+        speeds: Vec<f64>,
+        /// Linear decay windows.
+        #[arg(long, value_delimiter = ',', default_value = "0,4")]
+        decays: Vec<usize>,
+        /// Sort key: fitness, sharpe, return, margin.
+        #[arg(long, default_value = "fitness")]
+        sort: String,
     },
     /// PnL correlation between two alphas (BRAIN's self-correlation check).
     Corr {
@@ -274,6 +308,76 @@ fn main() -> Result<()> {
                     m.margin_bps,
                     m.max_drawdown_pct,
                     src
+                );
+            }
+        }
+        Cmd::Grid {
+            alpha,
+            data,
+            sim,
+            distances,
+            speeds,
+            decays,
+            sort,
+        } => {
+            let panel = load(&data)?;
+            let base = sim.settings();
+            let mut rows = Vec::new();
+            for &decay in &decays {
+                for &d in &distances {
+                    for &sp in &speeds {
+                        let mut s = base.clone();
+                        s.decay = decay;
+                        s.trade_distance = d;
+                        s.entry_speed = sp;
+                        match run_alpha(&panel, &alpha, &s) {
+                            Ok((_, m)) => rows.push((decay, d, sp, m)),
+                            Err(e) => eprintln!("skip decay={decay} dist={d} speed={sp}: {e:#}"),
+                        }
+                    }
+                }
+            }
+            let key = |m: &Metrics| match sort.as_str() {
+                "sharpe" => m.sharpe,
+                "return" => m.annual_return,
+                "margin" => m.margin_bps,
+                _ => m.fitness,
+            };
+            rows.sort_by(|a, b| {
+                key(&b.3)
+                    .partial_cmp(&key(&a.3))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            println!(
+                "alpha: {alpha}   cost {} bps   sorted by {sort}",
+                base.cost_bps
+            );
+            println!(
+                "{:>5} {:>7} {:>6} {:>8} {:>8} {:>8} {:>8} {:>8} {:>7} {:>7}",
+                "decay",
+                "dist",
+                "speed",
+                "fitness",
+                "sharpe",
+                "ret%",
+                "turn/d%",
+                "margin",
+                "maxdd%",
+                "IC"
+            );
+            for (decay, d, sp, m) in rows {
+                println!(
+                    "{:>5} {:>7.3} {:>6.2} {:>8.3} {:>8.3} {:>8.2} {:>8.1} {:>8.2} {:>7.2} {:>7.3}",
+                    decay,
+                    d,
+                    sp,
+                    m.fitness,
+                    m.sharpe,
+                    m.annual_return * 100.0,
+                    m.turnover_daily * 100.0,
+                    m.margin_bps,
+                    m.max_drawdown_pct,
+                    m.mean_ic
                 );
             }
         }

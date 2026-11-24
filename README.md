@@ -114,8 +114,14 @@ wq-bt run "rank(-ts_delta(close, 5))" --data-dir data/ --delay 1 --decay 4 --tru
 wq-bt run "-ts_corr(rank(close), rank(volume), 24)" --data-dir data/ --bar 4h --universe 10 --cost-bps 3
 wq-bt batch crates/wq-backtest/alphas.example.txt --data-dir data/     # many alphas, ranked by fitness
 wq-bt corr "rank(-ts_delta(close, 5))" "-ts_rank(returns, 24)" --data-dir data/   # PnL correlation
+wq-bt grid "-returns" --data-dir data/ --decays 0,4 --distances 0,0.01,0.02,0.05 --speeds 1,0.25,0.1 --cost-bps 3
 wq-bt ops                                                              # fields and operators
 ```
+
+Two turnover controls sit between target and held weights: `--trade-distance D` re-trades an
+instrument only after the sum of |returns| since its last trade reaches `D` (a distance gate),
+and `--entry-speed s` moves the held weight only `s` of the way toward the target per trade
+(gradual entry). `grid` sweeps both together with decay.
 
 Simulation settings mirror BRAIN: `--delay` (1 = alpha from the previous close), `--decay`
 (linear decay over N bars), `--neutralization market|none`, `--truncation` (max |weight| as a

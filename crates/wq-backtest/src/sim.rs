@@ -5,6 +5,11 @@
 //! dollar volume) → neutralization (market: demean) → scale to `booksize` (sum |w| = booksize)
 //! → truncation (cap |w_i| ≤ truncation · booksize, re-scaled) → weights `w_t`.
 //!
+//! Two turnover controls sit between the target weights and the held weights (see
+//! [`gate_weights`]): a *distance gate* that lets an instrument re-trade only after its price
+//! has travelled `trade_distance` (sum of |returns| since its last trade), and an *entry speed*
+//! that moves the held weight only a fraction of the way toward the target per trade.
+//!
 //! With `delay = 1` the weights at `t` come from the alpha computed at `t-1` (data through the
 //! previous close); `delay = 0` uses the alpha at `t`. Weights `w_t` are held over `(t, t+1]`
 //! and earn `w_t · r_{t+1}`. Turnover at `t` is `sum |w_t - w_{t-1}| / booksize`.
@@ -39,6 +44,12 @@ pub struct Settings {
     pub universe_window: usize,
     /// Transaction cost per dollar traded, basis points (0 = BRAIN's cost-free PnL).
     pub cost_bps: f64,
+    /// Distance gate: an instrument's weight is only updated once the sum of |returns| since
+    /// its last trade reaches this fraction (0.02 = 2%). 0 disables (trade every bar).
+    pub trade_distance: f64,
+    /// Entry speed: when a trade is allowed, move this fraction of the way from the current
+    /// weight to the target (1 = jump to target, 0.25 = ease in over ~4 trades).
+    pub entry_speed: f64,
 }
 
 impl Default for Settings {
@@ -52,6 +63,8 @@ impl Default for Settings {
             universe: 0,
             universe_window: 20,
             cost_bps: 0.0,
+            trade_distance: 0.0,
+            entry_speed: 1.0,
         }
     }
 }
@@ -105,6 +118,49 @@ pub fn weights_from_alpha(alpha: &mut [f64], mask: &[bool], s: &Settings) {
             *a = 0.0;
         }
     }
+}
+
+/// Turns target weights into held weights for one bar.
+///
+/// `dist[i]` accumulates |return| since instrument `i` last traded. An instrument trades when
+/// its distance reaches `trade_distance` (always, when the gate is 0 or the position is flat),
+/// moving `entry_speed` of the way from `prev[i]` to `target[i]`; otherwise it keeps `prev[i]`.
+/// Instruments outside the universe (`mask[i] == false`) are always flattened.
+pub fn gate_weights(
+    target: &[f64],
+    prev: &[f64],
+    mask: &[bool],
+    ret_now: &[f64],
+    dist: &mut [f64],
+    s: &Settings,
+) -> Vec<f64> {
+    let speed = if s.entry_speed <= 0.0 || s.entry_speed > 1.0 {
+        1.0
+    } else {
+        s.entry_speed
+    };
+    let mut out = Vec::with_capacity(target.len());
+    for i in 0..target.len() {
+        if ret_now[i].is_finite() {
+            dist[i] += ret_now[i].abs();
+        }
+        if !mask[i] {
+            out.push(0.0);
+            dist[i] = 0.0;
+            continue;
+        }
+        let open = s.trade_distance <= 0.0 || dist[i] >= s.trade_distance || prev[i] == 0.0;
+        if open {
+            let w = prev[i] + speed * (target[i] - prev[i]);
+            if w != prev[i] {
+                dist[i] = 0.0;
+            }
+            out.push(w);
+        } else {
+            out.push(prev[i]);
+        }
+    }
+    out
 }
 
 fn spearman(a: &[f64], b: &[f64]) -> f64 {
@@ -181,6 +237,7 @@ pub fn simulate(panel: &Panel, alpha: &Mat, s: &Settings) -> SimResult {
         booksize: s.booksize,
     };
     let mut prev: Vec<f64> = vec![0.0; n];
+    let mut dist: Vec<f64> = vec![0.0; n];
 
     for ti in 0..t {
         // Alpha row that drives the position held over (ti, ti+1].
@@ -218,6 +275,11 @@ pub fn simulate(panel: &Panel, alpha: &Mat, s: &Settings) -> SimResult {
             &next_ret,
         );
         weights_from_alpha(&mut row, &mask, s);
+        let row = if s.trade_distance > 0.0 || s.entry_speed < 1.0 {
+            gate_weights(&row, &prev, &mask, panel.returns.row(ti), &mut dist, s)
+        } else {
+            row
+        };
 
         let traded: f64 = row.iter().zip(&prev).map(|(w, p)| (w - p).abs()).sum();
         res.traded[ti] = traded;
@@ -284,7 +346,75 @@ mod tests {
             universe: 0,
             universe_window: 2,
             cost_bps: 0.0,
+            trade_distance: 0.0,
+            entry_speed: 1.0,
         }
+    }
+
+    #[test]
+    fn distance_gate_holds_until_price_travels() {
+        let mut s = settings();
+        s.trade_distance = 0.05;
+        let mask = [true, true];
+        let mut dist = vec![0.0, 0.0];
+        // First trade from flat always happens.
+        let w1 = gate_weights(
+            &[50.0, -50.0],
+            &[0.0, 0.0],
+            &mask,
+            &[0.0, 0.0],
+            &mut dist,
+            &s,
+        );
+        assert_eq!(w1, vec![50.0, -50.0]);
+        // Target flips but the price moved only 1%: hold.
+        let w2 = gate_weights(&[-50.0, 50.0], &w1, &mask, &[0.01, -0.01], &mut dist, &s);
+        assert_eq!(w2, w1);
+        // Cumulative 5%: trade, and the distance resets.
+        let w3 = gate_weights(&[-50.0, 50.0], &w2, &mask, &[0.04, 0.04], &mut dist, &s);
+        assert_eq!(w3, vec![-50.0, 50.0]);
+        assert_eq!(dist, vec![0.0, 0.0]);
+        // Leaving the universe flattens regardless of the gate.
+        let w4 = gate_weights(
+            &[0.0, 50.0],
+            &w3,
+            &[false, true],
+            &[0.0, 0.0],
+            &mut dist,
+            &s,
+        );
+        assert_eq!(w4[0], 0.0);
+    }
+
+    #[test]
+    fn entry_speed_eases_in() {
+        let mut s = settings();
+        s.entry_speed = 0.5;
+        let mut dist = vec![0.0];
+        let w1 = gate_weights(&[100.0], &[0.0], &[true], &[0.0], &mut dist, &s);
+        assert_eq!(w1, vec![50.0]);
+        let w2 = gate_weights(&[100.0], &w1, &[true], &[0.0], &mut dist, &s);
+        assert_eq!(w2, vec![75.0]);
+    }
+
+    #[test]
+    fn gate_reduces_turnover_and_defaults_match_baseline() {
+        let p = panel();
+        let a = evaluate(&p, &parse("-ts_delta(close, 1)").unwrap()).unwrap();
+        let base = simulate(&p, &a, &settings());
+        let mut s = settings();
+        let same = simulate(&p, &a, &s);
+        assert_eq!(base.pnl, same.pnl);
+        s.trade_distance = 0.08;
+        let gated = simulate(&p, &a, &s);
+        let t0: f64 = base.turnover.iter().sum();
+        let t1: f64 = gated.turnover.iter().sum();
+        assert!(t1 < t0, "gate should cut turnover: {t1} vs {t0}");
+        s.trade_distance = 0.0;
+        s.entry_speed = 0.25;
+        let slow = simulate(&p, &a, &s);
+        let t2: f64 = slow.turnover.iter().sum();
+        assert!(t2 < t0, "slow entry should cut turnover: {t2} vs {t0}");
     }
 
     #[test]
