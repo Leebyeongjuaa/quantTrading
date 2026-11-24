@@ -107,6 +107,9 @@ alpha values becomes dollar-neutral long/short weights and earns the next bar's 
 ```bash
 # 1. data: one CSV per instrument in a directory
 lighter-cli candles-universe --top 30 --asset-class crypto --resolution 1h --days 90 --out-dir data/
+# longer history: Lighter starts 2025-01-17; earlier bars are backfilled from Binance USDT-M
+# futures archives (data.binance.vision) and spliced with a median close ratio over the overlap
+lighter-cli candles-universe --top 30 --asset-class crypto --resolution 1h --days 800 --fallback binance --out-dir data/
 
 # 2. simulate
 wq-bt info --data-dir data/

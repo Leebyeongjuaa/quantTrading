@@ -21,6 +21,7 @@ quantTrading/
 │   │   ├── src/nonce.rs             # per-key nonce manager
 │   │   ├── src/gateway.rs           # OrderGateway: round, validate, sign, send (single/batch)
 │   │   ├── src/candles.rs           # resample (5m -> 10m) + CSV export
+│   │   ├── src/binance.rs           # Binance futures archive backfill + splice (history before Lighter)
 │   │   ├── src/exec/iceberg.rs      # IcebergPlanner (pure state machine) + IcebergExecutor
 │   │   ├── src/exec/pair.rs         # PairExecutor (batched IOC legs) + PairSizer
 │   │   ├── src/bin/lighter-cli.rs   # CLI

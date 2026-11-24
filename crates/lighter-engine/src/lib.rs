@@ -12,6 +12,7 @@
 //! Everything that touches the network is `async` (tokio). Nothing here holds the private key
 //! except the signer; the key is read from `LIGHTER_API_KEY_PRIVATE` by [`config::Config`].
 
+pub mod binance;
 pub mod candles;
 pub mod config;
 pub mod error;

@@ -67,10 +67,14 @@ enum Cmd {
         asset_class: Option<AssetClass>,
         #[arg(long, default_value = "1h")]
         resolution: String,
+        /// How far back to go. Lighter history starts 2025-01-17; earlier bars need --fallback.
         #[arg(long, default_value_t = 90)]
         days: u32,
         #[arg(long)]
         resample: Option<String>,
+        /// Fill the period before a Lighter market existed from another venue's archive.
+        #[arg(long, value_enum, default_value = "none")]
+        fallback: Fallback,
         #[arg(long)]
         out_dir: std::path::PathBuf,
     },
@@ -178,6 +182,13 @@ enum Cmd {
         #[arg(long)]
         reduce_only: bool,
     },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum Fallback {
+    None,
+    /// Binance USDT-M futures klines from data.binance.vision, spliced before Lighter data.
+    Binance,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -331,6 +342,7 @@ async fn main() -> anyhow::Result<()> {
             resolution,
             days,
             resample,
+            fallback,
             out_dir,
         } => {
             if !lighter_engine::rest::CANDLE_RESOLUTIONS.contains(&resolution.as_str()) {
@@ -377,10 +389,41 @@ async fn main() -> anyhow::Result<()> {
             std::fs::create_dir_all(&out_dir)?;
             let end = chrono::Utc::now().timestamp_millis();
             let start = end - days as i64 * 86_400_000;
+            let binance = match fallback {
+                Fallback::Binance => Some(lighter_engine::binance::BinanceSource::new()?),
+                Fallback::None => None,
+            };
+            let mut coverage = Vec::new();
             for m in chosen {
-                let mut bars = rest
+                let lighter = rest
                     .candles_range(m.market_id, &resolution, start, end)
                     .await?;
+                let first = lighter.first().map(|c| c.open_time_ms);
+                let mut bars = lighter.clone();
+                let mut note = String::new();
+                let mut bn_used = 0usize;
+                let mut ratio = 1.0;
+                if let Some(bn) = &binance {
+                    let gap = first.map(|f| f - start > src_ms).unwrap_or(true);
+                    if gap {
+                        let sym = lighter_engine::binance::futures_symbol(&m.symbol);
+                        let bn_end = first.map(|f| f + 48 * src_ms).unwrap_or(end).min(end);
+                        match bn.klines(&sym, &resolution, start, bn_end).await {
+                            Ok(b) if !b.is_empty() => {
+                                let (spliced, r, used) =
+                                    lighter_engine::binance::splice(&b, &lighter);
+                                bars = spliced;
+                                bn_used = used;
+                                ratio = r;
+                                note = format!("+{used} binance bars ({sym}, ratio {r:.5})");
+                            }
+                            Ok(_) => note = format!("no binance archive for {sym}"),
+                            Err(e) => note = format!("binance fetch failed for {sym}: {e}"),
+                        }
+                    }
+                }
+                let raw_first = bars.first().map(|c| c.open_time_ms);
+                let raw_last = bars.last().map(|c| c.open_time_ms);
                 if let Some(t) = tgt_ms {
                     bars = candles::resample(&bars, t);
                 }
@@ -388,13 +431,35 @@ async fn main() -> anyhow::Result<()> {
                 let f = std::fs::File::create(&path)
                     .with_context(|| format!("create {}", path.display()))?;
                 candles::write_csv(std::io::BufWriter::new(f), &bars)?;
+                let fmt = |ms: Option<i64>| {
+                    ms.and_then(chrono::DateTime::from_timestamp_millis)
+                        .map(|d| d.format("%Y-%m-%d").to_string())
+                        .unwrap_or_else(|| "-".into())
+                };
                 println!(
-                    "{:<10} {:>6} bars -> {}",
+                    "{:<10} {:>6} bars  {} .. {}  lighter from {}  {}",
                     m.symbol,
                     bars.len(),
-                    path.display()
+                    fmt(raw_first),
+                    fmt(raw_last),
+                    fmt(first),
+                    note
                 );
+                coverage.push(serde_json::json!({
+                    "symbol": m.symbol,
+                    "market_id": m.market_id,
+                    "bars": bars.len(),
+                    "from": raw_first,
+                    "to": raw_last,
+                    "lighter_from": first,
+                    "binance_bars": bn_used,
+                    "binance_ratio": ratio,
+                }));
             }
+            std::fs::write(
+                out_dir.join("coverage.json"),
+                serde_json::to_string_pretty(&coverage)?,
+            )?;
         }
         Cmd::WsDump { symbol, seconds } => {
             let catalog = MarketCatalog::load(&rest).await?;

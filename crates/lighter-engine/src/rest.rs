@@ -232,6 +232,8 @@ impl RestClient {
                 .max()
                 .unwrap_or(page_end);
             out.extend(page);
+            // Be polite on long histories (dozens of pages per market).
+            tokio::time::sleep(Duration::from_millis(120)).await;
             cursor = (last + step).max(page_end.min(last + step));
             if last + step <= cursor && cursor <= last {
                 break;
