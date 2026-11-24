@@ -206,9 +206,22 @@ impl RestClient {
         let mut cursor = start_ms;
         while cursor < end_ms {
             let page_end = (cursor + step * CANDLE_PAGE).min(end_ms);
-            let page = self
-                .candles(market_id, resolution, cursor, page_end, CANDLE_PAGE)
-                .await?;
+            // Bulk downloads trip Lighter's rate limiter now and then; retry with backoff.
+            let mut attempt = 0;
+            let page = loop {
+                match self
+                    .candles(market_id, resolution, cursor, page_end, CANDLE_PAGE)
+                    .await
+                {
+                    Ok(p) => break p,
+                    Err(e) if attempt < 3 => {
+                        attempt += 1;
+                        tokio::time::sleep(Duration::from_millis(500 * attempt)).await;
+                        tracing::warn!(error = %e, attempt, "candles page failed; retrying");
+                    }
+                    Err(e) => return Err(e),
+                }
+            };
             if page.is_empty() {
                 cursor = page_end;
                 continue;

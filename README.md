@@ -106,7 +106,7 @@ alpha values becomes dollar-neutral long/short weights and earns the next bar's 
 
 ```bash
 # 1. data: one CSV per instrument in a directory
-lighter-cli candles-universe --top 20 --resolution 1h --days 90 --out-dir data/
+lighter-cli candles-universe --top 30 --asset-class crypto --resolution 1h --days 90 --out-dir data/
 
 # 2. simulate
 wq-bt info --data-dir data/

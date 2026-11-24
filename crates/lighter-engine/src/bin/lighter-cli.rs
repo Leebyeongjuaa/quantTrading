@@ -62,6 +62,9 @@ enum Cmd {
         symbols: Vec<String>,
         #[arg(long, default_value_t = 20)]
         top: usize,
+        /// Restrict the top-N ranking to one asset class.
+        #[arg(long, value_enum)]
+        asset_class: Option<AssetClass>,
         #[arg(long, default_value = "1h")]
         resolution: String,
         #[arg(long, default_value_t = 90)]
@@ -175,6 +178,30 @@ enum Cmd {
         #[arg(long)]
         reduce_only: bool,
     },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum AssetClass {
+    Crypto,
+    Commodity,
+    Fx,
+    UsEquity,
+    IntlEquity,
+    Other,
+}
+
+impl AssetClass {
+    /// Lighter's `strategy_index` code for the class.
+    fn code(self) -> i64 {
+        match self {
+            AssetClass::Crypto => 2,
+            AssetClass::Commodity => 3,
+            AssetClass::Fx => 4,
+            AssetClass::UsEquity => 5,
+            AssetClass::IntlEquity => 6,
+            AssetClass::Other => 7,
+        }
+    }
 }
 
 #[tokio::main]
@@ -300,6 +327,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::CandlesUniverse {
             symbols,
             top,
+            asset_class,
             resolution,
             days,
             resample,
@@ -313,6 +341,9 @@ async fn main() -> anyhow::Result<()> {
             }
             let mut markets = rest.order_book_details(None).await?;
             markets.retain(|m| m.status == "active" && !m.is_frozen);
+            if let Some(c) = asset_class {
+                markets.retain(|m| m.strategy_index == c.code());
+            }
             let chosen: Vec<_> = if symbols.is_empty() {
                 markets.sort_by(|a, b| {
                     b.daily_quote_volume

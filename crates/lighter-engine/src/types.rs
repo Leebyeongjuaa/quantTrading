@@ -118,6 +118,10 @@ pub struct MarketInfo {
     pub is_frozen: bool,
     #[serde(default, rename = "daily_quote_token_volume")]
     pub daily_quote_volume: f64,
+    /// Lighter's asset-class code: 2 crypto, 3 commodities, 4 FX, 5 US equities/indices,
+    /// 6 international equities, 7 pre-market / other.
+    #[serde(default)]
+    pub strategy_index: i64,
 }
 
 impl MarketInfo {
