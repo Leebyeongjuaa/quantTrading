@@ -146,8 +146,11 @@ cross-sectional `rank zscore scale normalize winsorize truncate`; time-series `t
 ts_std_dev ts_delta ts_delay ts_returns ts_rank ts_min ts_max ts_arg_max ts_arg_min ts_corr
 ts_covariance ts_decay_linear ts_decay_exp_window ts_zscore ts_scale ts_av_diff ts_product
 ts_backfill hump`; fields `open high low close volume dollar_volume returns vwap adv(d)`.
-Group operators (industry neutralization) are not implemented because the universe has no
-sector data.
+Grouping helpers for cross-asset signals: `top_n(x, n)` (1 for the n largest `x` in the
+cross-section), `mean_if(x, cond)` (mean of `x` over the names where `cond != 0`, broadcast to
+every name) and `ts_beta(y, x, d)` (rolling regression slope). Example, majors lead minors:
+`if_else(top_n(adv(24),5), 0, ts_beta(returns, mean_if(returns, top_n(adv(24),5)), 168) * mean_if(returns, top_n(adv(24),5)))`.
+Industry-group operators are not implemented because the universe has no sector data.
 
 ## Research notes
 

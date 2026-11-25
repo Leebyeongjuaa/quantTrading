@@ -99,6 +99,18 @@ pub const OPERATORS: &[(&str, &str)] = &[
         "ignore changes smaller than hump · mean|x|",
     ),
     ("adv(d) adv20", "trailing mean dollar volume"),
+    (
+        "top_n(x, n)",
+        "1 for the n largest x in the cross-section, else 0",
+    ),
+    (
+        "mean_if(x, cond)",
+        "cross-sectional mean of x where cond != 0, broadcast to all",
+    ),
+    (
+        "ts_beta(y, x, d)",
+        "rolling regression slope of y on x (cov/var)",
+    ),
 ];
 
 fn valid(w: &[f64]) -> Vec<f64> {
@@ -466,6 +478,64 @@ impl<'a> Evaluator<'a> {
             "multiply" => x(0)?.zip(&x(1)?, |a, b| a * b),
             "divide" => x(0)?.zip(&x(1)?, |a, b| if b == 0.0 { f64::NAN } else { a / b }),
 
+            // ---- grouping helpers
+            "top_n" => {
+                let k = self.arg_num(name, args, kwargs, 1, "n", None)?;
+                if k < 1.0 {
+                    bail!("top_n: n must be >= 1");
+                }
+                let mut m = x(0)?;
+                m.for_each_row(|row| {
+                    let mut idx: Vec<usize> =
+                        (0..row.len()).filter(|&i| row[i].is_finite()).collect();
+                    idx.sort_by(|&a, &b| row[b].partial_cmp(&row[a]).unwrap());
+                    let top: std::collections::HashSet<usize> =
+                        idx.iter().take(k as usize).copied().collect();
+                    for (i, v) in row.iter_mut().enumerate() {
+                        if v.is_finite() {
+                            *v = if top.contains(&i) { 1.0 } else { 0.0 };
+                        }
+                    }
+                });
+                m
+            }
+            "mean_if" => {
+                let m = x(0)?;
+                let c = x(1)?;
+                let mut out = Mat::nan(t, n);
+                for ti in 0..t {
+                    let (mut sum, mut cnt) = (0.0, 0usize);
+                    for i in 0..n {
+                        let v = m.get(ti, i);
+                        let cv = c.get(ti, i);
+                        if v.is_finite() && cv.is_finite() && cv != 0.0 {
+                            sum += v;
+                            cnt += 1;
+                        }
+                    }
+                    let mu = if cnt > 0 { sum / cnt as f64 } else { f64::NAN };
+                    for i in 0..n {
+                        out.set(ti, i, mu);
+                    }
+                }
+                out
+            }
+            "ts_beta" => {
+                let d = self.arg_window(name, args, kwargs, 2)?;
+                ts_apply2(&x(0)?, &x(1)?, d, move |wy, wx| {
+                    let (b, a) = pairs(wy, wx);
+                    if a.len() < min_count(d).max(3) {
+                        return f64::NAN;
+                    }
+                    let m = mean(&a);
+                    let var = a.iter().map(|v| (v - m).powi(2)).sum::<f64>() / (a.len() - 1) as f64;
+                    if var > 0.0 {
+                        covariance(&b, &a) / var
+                    } else {
+                        f64::NAN
+                    }
+                })
+            }
             // ---- cross-sectional
             "rank" => {
                 let mut m = x(0)?;
@@ -911,6 +981,21 @@ mod tests {
         let h = hump(&x, 0.01);
         assert!(close(h.get(1, 0), 1.0));
         assert!(close(h.get(2, 0), 2.0));
+    }
+
+    #[test]
+    fn grouping_helpers() {
+        let m = ev("top_n(close, 1)");
+        assert_eq!(m.row(0), &[0.0, 1.0, 0.0]); // B has the highest close
+        let m = ev("mean_if(close, top_n(close, 2))");
+        assert!(close(m.get(0, 0), (10.0 + 50.0) / 2.0));
+        assert!(close(m.get(0, 2), (10.0 + 50.0) / 2.0));
+        let m = ev("mean_if(close, !top_n(close, 2))");
+        assert!(close(m.get(0, 1), 5.0));
+        // y = 2x exactly -> beta 2
+        let m = ev("ts_beta(close * 2, close, 4)");
+        assert!(close(m.get(3, 0), 2.0));
+        assert!(m.get(2, 0).is_nan());
     }
 
     #[test]
