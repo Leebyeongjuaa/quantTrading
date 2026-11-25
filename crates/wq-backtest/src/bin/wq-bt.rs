@@ -69,7 +69,8 @@ struct SimArgs {
     #[arg(long, value_enum, default_value = "portfolio")]
     distance_scope: DistanceScope,
     /// `price`: cumulative |return| (mean over the universe for portfolio scope);
-    /// `signal`: pending turnover sum|target - held| / booksize.
+    /// `signal`: pending turnover sum|target - held| / booksize;
+    /// `signal-change`: sum|target_t - target_{t-1}| accumulated since the last trade.
     #[arg(long, value_enum, default_value = "price")]
     gate: GateMode,
     /// Position smoothing: hold the trailing simple moving average of the target weights over

@@ -128,7 +128,8 @@ and `--entry-speed s` moves the held weight only `s` of the way toward the targe
 gate stays closed (0 = hold). The gate measures either price travel (`--gate price`: cumulative
 |return|, the universe mean per bar under `--distance-scope portfolio`, so it does not change
 with the number of instruments) or signal drift (`--gate signal`: pending turnover
-`sum|target - held| / booksize`). `--smooth N` holds the trailing N-bar simple moving average
+`sum|target - held| / booksize`, or `--gate signal-change`: `sum|target_t - target_{t-1}|`
+accumulated since the last trade). `--smooth N` holds the trailing N-bar simple moving average
 of the scaled target weights (position smoothing, applied before the gate). `grid` sweeps
 distance × speed × exit with decay.
 

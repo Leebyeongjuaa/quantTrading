@@ -40,6 +40,10 @@ pub enum GateMode {
     /// instrument scope: `|target_i - held_i|` relative to the average absolute weight
     /// `booksize / n`. Threshold is that fraction (0.5 = rebalance once half the book is stale).
     Signal,
+    /// Signal change accumulated since the last trade: `sum|target_t - target_{t-1}|` summed
+    /// over bars (portfolio scope: relative to booksize; instrument scope: relative to the
+    /// average absolute weight). Resets when a trade happens.
+    SignalChange,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
@@ -160,6 +164,10 @@ pub fn weights_from_alpha(alpha: &mut [f64], mask: &[bool], s: &Settings) {
 pub struct GateState {
     pub per: Vec<f64>,
     pub all: f64,
+    /// Target row of the previous bar (for `SignalChange`).
+    pub last_target: Option<Vec<f64>>,
+    pub chg_per: Vec<f64>,
+    pub chg_all: f64,
 }
 
 impl GateState {
@@ -167,6 +175,9 @@ impl GateState {
         GateState {
             per: vec![0.0; n],
             all: 0.0,
+            last_target: None,
+            chg_per: vec![0.0; n],
+            chg_all: 0.0,
         }
     }
 }
@@ -219,10 +230,25 @@ pub fn gate_weights(
         / s.booksize;
     let per_scale = s.booksize / n_mask as f64;
 
+    // Signal change since the last trade.
+    if let Some(last) = &state.last_target {
+        let mut tot = 0.0;
+        for i in 0..n {
+            let d = (target[i] - last[i]).abs();
+            state.chg_per[i] += d / per_scale;
+            if mask[i] {
+                tot += d;
+            }
+        }
+        state.chg_all += tot / s.booksize;
+    }
+    state.last_target = Some(target.to_vec());
+
     let book_open = always
         || match s.gate_mode {
             GateMode::Price => state.all >= s.trade_distance,
             GateMode::Signal => pending >= s.trade_distance,
+            GateMode::SignalChange => state.chg_all >= s.trade_distance,
         };
 
     let mut out = Vec::with_capacity(n);
@@ -231,6 +257,7 @@ pub fn gate_weights(
         if !mask[i] {
             out.push(0.0);
             state.per[i] = 0.0;
+            state.chg_per[i] = 0.0;
             continue;
         }
         let open = if portfolio {
@@ -240,12 +267,16 @@ pub fn gate_weights(
                 || match s.gate_mode {
                     GateMode::Price => state.per[i] >= s.trade_distance || prev[i] == 0.0,
                     GateMode::Signal => (target[i] - prev[i]).abs() >= s.trade_distance * per_scale,
+                    GateMode::SignalChange => {
+                        state.chg_per[i] >= s.trade_distance || prev[i] == 0.0
+                    }
                 }
         };
         if open {
             let w = prev[i] + speed * (target[i] - prev[i]);
             if w != prev[i] {
                 state.per[i] = 0.0;
+                state.chg_per[i] = 0.0;
                 traded_any = true;
             }
             out.push(w);
@@ -255,6 +286,7 @@ pub fn gate_weights(
     }
     if portfolio && book_open && traded_any {
         state.all = 0.0;
+        state.chg_all = 0.0;
     }
     out
 }
@@ -533,6 +565,26 @@ mod tests {
         s.trade_distance = 0.5; // 25 per name
         let w4 = gate_weights(&[-30.0, 20.0], &w3, &mask, &[0.0, 0.0], &mut g, &s);
         assert_eq!(w4, vec![-50.0, 20.0]); // first moved 20 (<25): hold; second moved 30: trade
+    }
+
+    #[test]
+    fn signal_change_gate_accumulates_until_trade() {
+        let mut s = settings();
+        s.gate_mode = GateMode::SignalChange;
+        s.distance_scope = DistanceScope::Portfolio;
+        s.trade_distance = 0.5;
+        let mask = [true, true];
+        let mut g = GateState::new(2);
+        // No previous target yet: nothing accumulated, gate closed, stays flat.
+        let w1 = gate_weights(&[50.0, -50.0], &[0.0, 0.0], &mask, &[0.0, 0.0], &mut g, &s);
+        assert_eq!(w1, vec![0.0, 0.0]);
+        // Target drifts 10 per name (20% of book): closed.
+        let w2 = gate_weights(&[40.0, -60.0], &w1, &mask, &[0.0, 0.0], &mut g, &s);
+        assert_eq!(w2, vec![0.0, 0.0]);
+        // Another 20 per name: cumulative 60% >= 50%: trade to the current target, reset.
+        let w3 = gate_weights(&[20.0, -80.0], &w2, &mask, &[0.0, 0.0], &mut g, &s);
+        assert_eq!(w3, vec![20.0, -80.0]);
+        assert_eq!(g.chg_all, 0.0);
     }
 
     #[test]
