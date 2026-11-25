@@ -135,7 +135,7 @@ distance × speed × exit with decay.
 
 Simulation settings mirror BRAIN: `--delay` (1 = alpha from the previous close), `--decay`
 (linear decay over N bars), `--neutralization market|none`, `--truncation` (max |weight| as a
-fraction of the book), `--booksize`, `--universe N` (top-N by trailing dollar volume) and an
+fraction of the book), `--booksize`, `--universe N` (top-N by trailing dollar volume, re-ranked each bar, or fixed at the start with `--universe-mode static`) and an
 optional `--cost-bps`. Reported: annualized Sharpe, annual return, daily turnover,
 `fitness = sharpe · sqrt(|return| / max(turnover, 0.125))`, margin (bps per dollar traded),
 max drawdown, mean IC / ICIR, long/short counts and a yearly or monthly breakdown. Outputs:
@@ -148,6 +148,11 @@ ts_covariance ts_decay_linear ts_decay_exp_window ts_zscore ts_scale ts_av_diff 
 ts_backfill hump`; fields `open high low close volume dollar_volume returns vwap adv(d)`.
 Group operators (industry neutralization) are not implemented because the universe has no
 sector data.
+
+## Research notes
+
+Alpha write-ups live in `research/` (one Markdown file per signal, with settings, results and
+reproduction commands). Start with `research/reversal-1h.md`.
 
 ## Verifying the signer against Go
 

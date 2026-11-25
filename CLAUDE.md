@@ -42,6 +42,7 @@ quantTrading/
 │       ├── src/metrics.rs           # Sharpe, returns, turnover, fitness, margin, IC, drawdown
 │       ├── src/bin/wq-bt.rs         # run / batch / corr / check / ops / info
 │       └── alphas.example.txt       # sample alphas for `wq-bt batch`
+├── research/                        # alpha notes (signal, settings, results, how to reproduce)
 ├── tools/go-signer-check/           # Go program verifying Rust signatures with lighter-go
 ├── .env.example                     # LIGHTER_ACCOUNT_INDEX / LIGHTER_API_KEY_INDEX / LIGHTER_API_KEY_PRIVATE
 └── CLAUDE.md
