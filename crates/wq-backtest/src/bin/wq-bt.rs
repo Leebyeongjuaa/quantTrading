@@ -228,6 +228,8 @@ fn write_outputs(dir: &PathBuf, panel: &Panel, r: &SimResult, m: &Metrics) -> Re
         "turnover",
         "long",
         "short",
+        "long_notional",
+        "short_notional",
         "ic",
     ])?;
     let mut cum = 0.0;
@@ -243,6 +245,8 @@ fn write_outputs(dir: &PathBuf, panel: &Panel, r: &SimResult, m: &Metrics) -> Re
             format!("{:.6}", r.turnover[t]),
             r.long_count[t].to_string(),
             r.short_count[t].to_string(),
+            format!("{:.2}", r.long_notional[t]),
+            format!("{:.2}", r.short_notional[t]),
             format!("{:.4}", r.ic[t]),
         ])?;
     }
