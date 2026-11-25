@@ -72,6 +72,10 @@ struct SimArgs {
     /// `signal`: pending turnover sum|target - held| / booksize.
     #[arg(long, value_enum, default_value = "price")]
     gate: GateMode,
+    /// Position smoothing: hold the trailing simple moving average of the target weights over
+    /// this many bars (0 = off). Applied after scaling, before the gate.
+    #[arg(long, default_value_t = 0)]
+    smooth: usize,
 }
 
 impl SimArgs {
@@ -90,6 +94,7 @@ impl SimArgs {
             exit_speed: self.exit_speed,
             distance_scope: self.distance_scope,
             gate_mode: self.gate,
+            smooth: self.smooth,
         }
     }
 }

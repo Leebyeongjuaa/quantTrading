@@ -77,6 +77,10 @@ pub struct Settings {
     pub exit_speed: f64,
     pub distance_scope: DistanceScope,
     pub gate_mode: GateMode,
+    /// Position smoothing: the target weights are replaced by their trailing simple moving
+    /// average over this many bars (0/1 = off). Applied after neutralization and scaling, so
+    /// gross exposure can fall below the book when targets flip; it is not rescaled.
+    pub smooth: usize,
 }
 
 impl Default for Settings {
@@ -95,6 +99,7 @@ impl Default for Settings {
             exit_speed: 0.0,
             distance_scope: DistanceScope::Portfolio,
             gate_mode: GateMode::Price,
+            smooth: 0,
         }
     }
 }
@@ -329,6 +334,7 @@ pub fn simulate(panel: &Panel, alpha: &Mat, s: &Settings) -> SimResult {
     };
     let mut prev: Vec<f64> = vec![0.0; n];
     let mut gate = GateState::new(n);
+    let mut history: std::collections::VecDeque<Vec<f64>> = std::collections::VecDeque::new();
 
     for ti in 0..t {
         // Alpha row that drives the position held over (ti, ti+1].
@@ -366,6 +372,16 @@ pub fn simulate(panel: &Panel, alpha: &Mat, s: &Settings) -> SimResult {
             &next_ret,
         );
         weights_from_alpha(&mut row, &mask, s);
+        if s.smooth > 1 {
+            history.push_back(row.clone());
+            if history.len() > s.smooth {
+                history.pop_front();
+            }
+            let k = history.len() as f64;
+            for (i, v) in row.iter_mut().enumerate() {
+                *v = history.iter().map(|h| h[i]).sum::<f64>() / k;
+            }
+        }
         let row = if s.trade_distance > 0.0 || s.entry_speed < 1.0 {
             gate_weights(&row, &prev, &mask, panel.returns.row(ti), &mut gate, s)
         } else {
@@ -442,6 +458,27 @@ mod tests {
             exit_speed: 0.0,
             distance_scope: DistanceScope::Instrument,
             gate_mode: GateMode::Price,
+            smooth: 0,
+        }
+    }
+
+    #[test]
+    fn position_smoothing_averages_targets_and_cuts_turnover() {
+        let p = panel();
+        let a = evaluate(&p, &parse("-ts_delta(close, 1)").unwrap()).unwrap();
+        let base = simulate(&p, &a, &settings());
+        let mut s = settings();
+        s.smooth = 3;
+        let sm = simulate(&p, &a, &s);
+        let t0: f64 = base.turnover.iter().sum();
+        let t1: f64 = sm.turnover.iter().sum();
+        assert!(t1 < t0, "smoothing should cut turnover: {t1} vs {t0}");
+        // Third held row equals the mean of the first three raw target rows.
+        let t = 2;
+        for i in 0..p.n() {
+            let mean =
+                (base.weights.get(0, i) + base.weights.get(1, i) + base.weights.get(2, i)) / 3.0;
+            assert!((sm.weights.get(t, i) - mean).abs() < 1e-9);
         }
     }
 
