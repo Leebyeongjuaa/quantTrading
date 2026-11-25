@@ -80,13 +80,30 @@ small per name; test N=50 next, with per-name costs.
   leave +0.6..3.9% average and +-10% on a day. Re-neutralize after truncation in production.
 - Monthly PnL is uneven; 2026-01 and 2026-02 are the worst months for most settings.
 
+## Latency test on 5m bars (added 2026-11-25)
+
+Panel: same 30 names, 5m bars, 2026-05-29 .. 2026-11-25 (51,840 bars). Signal
+`-ts_returns(close, 12)` (trailing 1h return), rebalanced every 5m, delay in 5m bars.
+
+| delay | Sharpe | annual return | turnover/day | margin | mean IC |
+|---|---|---|---|---|---|
+| 0 min | 40.1 | +1258% | 12936% | 2.66 bps | 0.051 |
+| 5 min | 17.1 | +527% | 12936% | 1.12 bps | 0.022 |
+| 15 min | 9.3 | +279% | 12936% | 0.59 bps | 0.012 |
+| 60 min | 4.3 | +124% | 12936% | 0.26 bps | 0.006 |
+
+- The edge halves every ~5-10 minutes. At 5 min delay with 3 bps cost: Sharpe -29.
+- Delay 0 on 5m closes is inflated by bid-ask bounce (a close at the bid followed by one at the
+  ask looks like reversal). Treat the 0-min row as an upper bound, not a forecast.
+- 5% universe-mean price gate at 5 min delay: Sharpe 2.4, turnover 1414%, still negative at 3 bps.
+- Conclusion: this is a liquidity-provision signal. It pays only to whoever is already resting
+  at the touch; a taker cannot harvest it at any gate setting tested.
+
 ## Open items
 
-1. Realistic latency: rebuild on 5m bars with `-ts_returns(close, 12)` and delays of 0/1/3 bars
-   (0/5/15 min). In progress.
-2. Maker execution model: the signal only pays if effective one-way cost is under ~2 bps.
-3. Wider universe (50) with liquidity-dependent costs.
-4. Re-neutralization step after truncation / gating.
+1. Maker execution model (resting limit orders, fill probability), which is the only path left.
+2. Wider universe (50) with liquidity-dependent costs.
+3. Re-neutralization step after truncation / gating.
 
 ## Reproduce
 
