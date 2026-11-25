@@ -7,7 +7,7 @@ use clap::{Args, Parser, Subcommand};
 use wq_backtest::ops::OPERATORS;
 use wq_backtest::{
     evaluate, parse, simulate, DistanceScope, GateMode, Metrics, Neutralization, Panel, Settings,
-    SimResult,
+    SimResult, UniverseMode,
 };
 
 #[derive(Parser)]
@@ -51,6 +51,9 @@ struct SimArgs {
     universe: usize,
     #[arg(long, default_value_t = 20)]
     universe_window: usize,
+    /// `dynamic`: re-rank every bar; `static`: rank once at the start and keep the set.
+    #[arg(long, value_enum, default_value = "dynamic")]
+    universe_mode: UniverseMode,
     /// Cost per dollar traded in bps (0 = cost-free like BRAIN).
     #[arg(long, default_value_t = 0.0)]
     cost_bps: f64,
@@ -89,6 +92,7 @@ impl SimArgs {
             booksize: self.booksize,
             universe: self.universe,
             universe_window: self.universe_window,
+            universe_mode: self.universe_mode,
             cost_bps: self.cost_bps,
             trade_distance: self.trade_distance,
             entry_speed: self.entry_speed,

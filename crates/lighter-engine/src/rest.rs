@@ -214,9 +214,11 @@ impl RestClient {
                     .await
                 {
                     Ok(p) => break p,
-                    Err(e) if attempt < 3 => {
+                    Err(e) if attempt < 8 => {
                         attempt += 1;
-                        tokio::time::sleep(Duration::from_millis(500 * attempt)).await;
+                        // Exponential backoff: 0.5s, 1s, 2s, ... capped at 30s.
+                        let wait = Duration::from_millis((500u64 << (attempt - 1)).min(30_000));
+                        tokio::time::sleep(wait).await;
                         tracing::warn!(error = %e, attempt, "candles page failed; retrying");
                     }
                     Err(e) => return Err(e),

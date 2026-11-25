@@ -46,6 +46,16 @@ pub enum GateMode {
     SignalChange,
 }
 
+/// How the top-N liquidity universe is maintained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+pub enum UniverseMode {
+    /// Re-rank every bar by trailing dollar volume (membership changes over time).
+    Dynamic,
+    /// Rank once, on the first bar where `universe` names have a liquidity value, and keep
+    /// that set for the whole backtest.
+    Static,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 pub enum Neutralization {
     None,
@@ -68,6 +78,7 @@ pub struct Settings {
     pub universe: usize,
     /// Trailing window (bars) for the liquidity ranking.
     pub universe_window: usize,
+    pub universe_mode: UniverseMode,
     /// Transaction cost per dollar traded, basis points (0 = BRAIN's cost-free PnL).
     pub cost_bps: f64,
     /// Distance gate: an instrument's weight is only updated once the sum of |returns| since
@@ -97,6 +108,7 @@ impl Default for Settings {
             booksize: 1_000_000.0,
             universe: 0,
             universe_window: 20,
+            universe_mode: UniverseMode::Dynamic,
             cost_bps: 0.0,
             trade_distance: 0.0,
             entry_speed: 1.0,
@@ -366,6 +378,7 @@ pub fn simulate(panel: &Panel, alpha: &Mat, s: &Settings) -> SimResult {
     };
     let mut prev: Vec<f64> = vec![0.0; n];
     let mut gate = GateState::new(n);
+    let mut static_set: Option<std::collections::HashSet<usize>> = None;
     let mut history: std::collections::VecDeque<Vec<f64>> = std::collections::VecDeque::new();
 
     for ti in 0..t {
@@ -385,15 +398,24 @@ pub fn simulate(panel: &Panel, alpha: &Mat, s: &Settings) -> SimResult {
             .map(|i| row[i].is_finite() && panel.close.get(ti, i).is_finite())
             .collect();
         if let Some(liq) = &liquidity {
-            let mut ranked: Vec<(usize, f64)> = (0..n)
-                .filter(|&i| mask[i] && liq.get(src, i).is_finite())
-                .map(|i| (i, liq.get(src, i)))
-                .collect();
-            ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-            let keep: std::collections::HashSet<usize> =
-                ranked.iter().take(s.universe).map(|x| x.0).collect();
+            let keep: std::collections::HashSet<usize> = match (s.universe_mode, &static_set) {
+                (UniverseMode::Static, Some(set)) => set.clone(),
+                _ => {
+                    let mut ranked: Vec<(usize, f64)> = (0..n)
+                        .filter(|&i| liq.get(src, i).is_finite())
+                        .map(|i| (i, liq.get(src, i)))
+                        .collect();
+                    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                    let set: std::collections::HashSet<usize> =
+                        ranked.iter().take(s.universe).map(|x| x.0).collect();
+                    if s.universe_mode == UniverseMode::Static && ranked.len() >= s.universe {
+                        static_set = Some(set.clone());
+                    }
+                    set
+                }
+            };
             for (i, m) in mask.iter_mut().enumerate() {
-                *m = keep.contains(&i);
+                *m = *m && keep.contains(&i);
             }
         }
         res.ic[ti] = spearman(
@@ -484,6 +506,7 @@ mod tests {
             booksize: 100.0,
             universe: 0,
             universe_window: 2,
+            universe_mode: UniverseMode::Dynamic,
             cost_bps: 0.0,
             trade_distance: 0.0,
             entry_speed: 1.0,

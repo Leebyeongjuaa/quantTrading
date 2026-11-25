@@ -22,4 +22,6 @@ pub use mat::Mat;
 pub use metrics::Metrics;
 pub use ops::{evaluate, Evaluator};
 pub use panel::Panel;
-pub use sim::{simulate, DistanceScope, GateMode, Neutralization, Settings, SimResult};
+pub use sim::{
+    simulate, DistanceScope, GateMode, Neutralization, Settings, SimResult, UniverseMode,
+};

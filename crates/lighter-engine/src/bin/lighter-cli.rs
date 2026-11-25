@@ -395,9 +395,22 @@ async fn main() -> anyhow::Result<()> {
             };
             let mut coverage = Vec::new();
             for m in chosen {
-                let lighter = rest
+                // Skip existing files so an interrupted download can be resumed.
+                let path = out_dir.join(format!("{}.csv", m.symbol));
+                if path.exists() {
+                    println!("{:<10} exists, skipping", m.symbol);
+                    continue;
+                }
+                let lighter = match rest
                     .candles_range(m.market_id, &resolution, start, end)
-                    .await?;
+                    .await
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("{}: candle download failed, skipping: {e}", m.symbol);
+                        continue;
+                    }
+                };
                 let first = lighter.first().map(|c| c.open_time_ms);
                 let mut bars = lighter.clone();
                 let mut note = String::new();
@@ -427,7 +440,6 @@ async fn main() -> anyhow::Result<()> {
                 if let Some(t) = tgt_ms {
                     bars = candles::resample(&bars, t);
                 }
-                let path = out_dir.join(format!("{}.csv", m.symbol));
                 let f = std::fs::File::create(&path)
                     .with_context(|| format!("create {}", path.display()))?;
                 candles::write_csv(std::io::BufWriter::new(f), &bars)?;
