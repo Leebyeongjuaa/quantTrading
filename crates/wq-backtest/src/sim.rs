@@ -138,6 +138,8 @@ pub struct SimResult {
     /// Spearman IC between the raw alpha used at `t` and `r_{t+1}`.
     pub ic: Vec<f64>,
     pub weights: Mat,
+    /// Per-instrument PnL after costs, credited at the bar it is earned (same timing as `pnl`).
+    pub symbol_pnl: Mat,
     pub settings: Settings,
     pub booksize: f64,
 }
@@ -373,6 +375,7 @@ pub fn simulate(panel: &Panel, alpha: &Mat, s: &Settings) -> SimResult {
         traded: vec![0.0; t],
         ic: vec![f64::NAN; t],
         weights: Mat::filled(0, 0, 0.0),
+        symbol_pnl: Mat::filled(t, n, 0.0),
         settings: s.clone(),
         booksize: s.booksize,
     };
@@ -446,6 +449,13 @@ pub fn simulate(panel: &Panel, alpha: &Mat, s: &Settings) -> SimResult {
         res.traded[ti] = traded;
         res.turnover[ti] = traded / s.booksize;
         res.costs[ti] = traded * s.cost_bps / 10_000.0;
+        if s.cost_bps > 0.0 {
+            for i in 0..n {
+                let c = (row[i] - prev[i]).abs() * s.cost_bps / 10_000.0;
+                let v = res.symbol_pnl.get(ti, i) - c;
+                res.symbol_pnl.set(ti, i, v);
+            }
+        }
         res.long_count[ti] = row.iter().filter(|w| **w > 0.0).count();
         res.short_count[ti] = row.iter().filter(|w| **w < 0.0).count();
         res.long_notional[ti] = row.iter().filter(|w| **w > 0.0).sum();
@@ -460,6 +470,12 @@ pub fn simulate(panel: &Panel, alpha: &Mat, s: &Settings) -> SimResult {
                 .sum();
             res.gross_pnl[ti + 1] += gross;
             res.pnl[ti + 1] += gross;
+            for i in 0..n {
+                if next_ret[i].is_finite() {
+                    let v = res.symbol_pnl.get(ti + 1, i) + row[i] * next_ret[i];
+                    res.symbol_pnl.set(ti + 1, i, v);
+                }
+            }
         }
         weights.row_mut(ti).copy_from_slice(&row);
         prev = row;

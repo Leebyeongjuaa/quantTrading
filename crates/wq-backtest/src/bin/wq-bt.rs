@@ -271,6 +271,51 @@ fn write_outputs(dir: &PathBuf, panel: &Panel, r: &SimResult, m: &Metrics) -> Re
         w.write_record(&rec)?;
     }
     w.flush()?;
+    // Per-symbol daily aggregates: pnl, mean |weight|, bars long/short.
+    let mut w = csv::Writer::from_path(dir.join("symbol_daily.csv"))?;
+    w.write_record([
+        "day_ts",
+        "symbol",
+        "pnl",
+        "avg_abs_weight",
+        "long_bars",
+        "short_bars",
+    ])?;
+    let n = panel.symbols.len();
+    let mut day_start = 0usize;
+    while day_start < r.ts.len() {
+        let day = r.ts[day_start] - r.ts[day_start].rem_euclid(86_400_000);
+        let mut day_end = day_start;
+        while day_end < r.ts.len() && r.ts[day_end] - r.ts[day_end].rem_euclid(86_400_000) == day {
+            day_end += 1;
+        }
+        let bars = (day_end - day_start) as f64;
+        for i in 0..n {
+            let (mut pnl, mut absw, mut lb, mut sb) = (0.0, 0.0, 0usize, 0usize);
+            for t in day_start..day_end {
+                pnl += r.symbol_pnl.get(t, i);
+                let wt = r.weights.get(t, i);
+                absw += wt.abs();
+                if wt > 0.0 {
+                    lb += 1;
+                } else if wt < 0.0 {
+                    sb += 1;
+                }
+            }
+            if lb + sb > 0 || pnl != 0.0 {
+                w.write_record([
+                    day.to_string(),
+                    panel.symbols[i].clone(),
+                    format!("{pnl:.4}"),
+                    format!("{:.2}", absw / bars),
+                    lb.to_string(),
+                    sb.to_string(),
+                ])?;
+            }
+        }
+        day_start = day_end;
+    }
+    w.flush()?;
     std::fs::write(dir.join("summary.json"), serde_json::to_string_pretty(m)?)?;
     Ok(())
 }

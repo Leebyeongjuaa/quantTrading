@@ -155,8 +155,8 @@ Industry-group operators are not implemented because the universe has no sector 
 ## Charting results
 
 `tools/wq-report/build.py` turns one or more `wq-bt run --out` directories into the standard
-comparison page (cumulative PnL, gross/net exposure, daily and hour-of-day turnover, rolling win
-ratio, tables). The `wq-report` skill in `.claude/skills/` documents the workflow.
+comparison page (cumulative PnL before and after 3/5 bps costs, gross/net exposure, daily and
+hour-of-day turnover, rolling win ratio, per-symbol contribution, tables). The `wq-report` skill in `.claude/skills/` documents the workflow.
 
 ## Research notes
 

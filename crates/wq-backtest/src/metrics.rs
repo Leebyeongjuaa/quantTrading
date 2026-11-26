@@ -281,6 +281,7 @@ mod tests {
             traded: vec![2000.0; n],
             ic: vec![0.05; n],
             weights: Mat::filled(0, 0, 0.0),
+            symbol_pnl: Mat::filled(0, 0, 0.0),
             settings: Settings::default(),
             booksize: 10_000.0,
         };

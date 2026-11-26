@@ -12,7 +12,8 @@ Each positional argument is `label=path` (optionally `label|short=path`). The pa
 <out>/index.html with <out>/data.json beside it (fetched at runtime), ready to publish with the
 Artifact tool: file_path=<out>/index.html, files={"data.json": "<out>/data.json"}.
 
-Charts: cumulative PnL (% of book), gross and net exposure, daily turnover, hour-of-day turnover,
+Charts: cumulative PnL (% of book), cumulative PnL after extra one-way costs (`--fees 3,5`,
+charged as traded dollars x bps per bar on top of the run's own cost setting), per-symbol PnL contribution bars and per-symbol cumulative lines (from `symbol_daily.csv`), gross and net exposure, daily turnover, hour-of-day turnover,
 30-day rolling bar win ratio, a metrics table and a monthly table. All series share one palette
 slot order (max 8); numbers are aggregated per UTC day so the page stays small.
 """
@@ -28,19 +29,24 @@ PALETTE = [("#2a78d6", "#3987e5"), ("#eb6834", "#d95926"), ("#1baf7a", "#199e70"
 DAY = 86_400_000
 
 
-def load_run(path, book):
+def load_run(path, book, fees, keep_symbol_days=True):
     rows = list(csv.DictReader(open(os.path.join(path, "pnl.csv"))))
     summ = json.load(open(os.path.join(path, "summary.json")))
     first = next((i for i, r in enumerate(rows) if int(r["long"]) + int(r["short"]) > 0), 0)
     rows = rows[first:]
     days, hod_sum, hod_n = OrderedDict(), [0.0] * 24, [0] * 24
     wins = nz = 0
+    cum_fee = [0.0] * len(fees)
     for r in rows:
         ts = int(r["ts"]); d = ts - ts % DAY
         pnl = float(r["pnl"]); to = float(r["turnover"])
+        # Extra one-way cost on top of whatever the run already charged: traded $ x bps.
+        for k, f in enumerate(fees):
+            cum_fee[k] += pnl - to * book * f / 10_000
         ln, sn = float(r.get("long_notional", 0) or 0), float(r.get("short_notional", 0) or 0)
         e = days.setdefault(d, {"cum": 0.0, "g": 0.0, "net": 0.0, "to": 0.0, "w": 0, "nz": 0, "n": 0, "pnl": 0.0})
         e["cum"] = float(r["cum_pnl"]) / book * 100
+        e["cumfee"] = [round(c / book * 100, 3) for c in cum_fee]
         e["g"] += (ln + sn) / book; e["net"] += (ln - sn) / book; e["to"] += to; e["n"] += 1; e["pnl"] += pnl
         if pnl != 0.0:
             e["nz"] += 1; nz += 1
@@ -49,19 +55,35 @@ def load_run(path, book):
         h = (ts // 3_600_000) % 24
         hod_sum[h] += to; hod_n[h] += 1
     daily = [[d, round(e["cum"], 3), round(e["g"] / e["n"] * 100, 2), round(e["net"] / e["n"] * 100, 2),
-              round(e["to"] * 100, 2), e["w"], e["nz"], round(e["pnl"] / book * 100, 4)] for d, e in days.items()]
+              round(e["to"] * 100, 2), e["w"], e["nz"], round(e["pnl"] / book * 100, 4)] + e["cumfee"] for d, e in days.items()]
     hod = [round(hod_sum[h] / hod_n[h] * 100, 3) if hod_n[h] else None for h in range(24)]
     months = OrderedDict()
     for d, e in days.items():
         m = dt.datetime.fromtimestamp(d / 1000, dt.timezone.utc).strftime("%Y-%m")
         me = months.setdefault(m, {"w": 0, "nz": 0, "dw": 0, "dn": 0, "pnl": 0.0})
         me["w"] += e["w"]; me["nz"] += e["nz"]; me["dn"] += 1; me["dw"] += 1 if e["pnl"] > 0 else 0; me["pnl"] += e["pnl"]
+    symbols = {}
+    sym_path = os.path.join(path, "symbol_daily.csv")
+    if os.path.exists(sym_path):
+        first_day = daily[0][0] if daily else 0
+        acc = {}
+        for r in csv.DictReader(open(sym_path)):
+            d = int(r["day_ts"])
+            if d < first_day:
+                continue
+            e = acc.setdefault(r["symbol"], {"cum": 0.0, "days": [], "absw": 0.0, "n": 0})
+            e["cum"] += float(r["pnl"]); e["absw"] += float(r["avg_abs_weight"]); e["n"] += 1
+            e["days"].append([d, round(e["cum"] / book * 100, 3)])
+        symbols = {k: {"total": round(v["cum"] / book * 100, 3), "avg_abs_w": round(v["absw"] / v["n"] / book * 100, 2),
+                       "days": v["days"] if keep_symbol_days else []}
+                   for k, v in acc.items()}
     keys = ["sharpe", "annual_return", "turnover_daily", "fitness", "margin_bps", "max_drawdown_pct", "mean_ic",
             "avg_gross", "avg_net", "bars", "bars_per_year"]
     return {
         "daily": daily, "hod": hod,
         "summary": {k: summ.get(k) for k in keys},
         "win_ratio_bars": wins / nz if nz else None,
+        "symbols": symbols,
         "months": [[m, round(v["w"] / v["nz"] * 100, 1) if v["nz"] else None, round(v["dw"] / v["dn"] * 100, 1),
                     round(v["pnl"] / book * 100, 2)] for m, v in months.items()],
     }
@@ -137,16 +159,21 @@ td.pos { color: var(--pos); }
 .notes { color: var(--ink-2); font-size: 13px; display: grid; gap: 6px; padding-left: 18px; margin: 0; }
 .rel { color: var(--muted); font-size: 12px; }
 .err { color: var(--neg); }
+.sbar { cursor: default; }
+.sbar:hover, .sbar:focus { filter: brightness(1.12); outline: none; }
+.chart .symlab { fill: var(--ink-2); font-size: 11px; }
 </style>
 <main>
   <header><h1>__TITLE__</h1><p class="sub">__SUBTITLE__</p></header>
   <section class="tiles" id="tiles"></section>
   <section class="card"><div class="head"><div><h2>누적 PnL (북 대비 %)</h2><div class="rel">일 단위 집계. 노출이 낮은 설정은 북 대비 수익률이 작게 보이므로 Sharpe와 margin으로 비교.</div></div><div class="legend" data-legend></div></div><div class="chart" id="cum"></div></section>
+  <div id="fee-sections" style="display: contents"></div>
   <section class="card"><div class="head"><div><h2>총 노출 (Σ|w| / 북, 일 평균 %)</h2></div><div class="legend" data-legend></div></div><div class="chart" id="gross"></div></section>
   <section class="card"><div class="head"><div><h2>순 노출 (롱 − 숏, 일 평균 %)</h2></div><div class="legend" data-legend></div></div><div class="chart" id="net"></div></section>
   <section class="card"><div class="head"><div><h2>일 turnover (봉별 turnover의 하루 합, %)</h2></div><div class="legend" data-legend></div></div><div class="chart" id="turn"></div></section>
   <section class="card"><div class="head"><div><h2>시간대별 평균 봉 turnover (UTC 시, %)</h2></div><div class="legend" data-legend></div></div><div class="chart" id="hod"></div></section>
   <section class="card"><div class="head"><div><h2>승률 (봉 단위, 30일 롤링 %)</h2><div class="rel">PnL이 0이 아닌 봉 중 양수 비율.</div></div><div class="legend" data-legend></div></div><div class="chart" id="win"></div></section>
+  <div id="symbol-sections" style="display: contents"></div>
   <section class="card"><h2>지표 요약</h2><div class="scroll"><table id="table"></table></div></section>
   <section class="card"><h2>월별 (봉 승률 % / 일 승률 % / 월 수익률 %)</h2><div class="scroll"><table id="months"></table></div></section>
   __NOTES__
@@ -229,12 +256,65 @@ function render(DATA) {
   const col = (s, i) => ({ s, xs: DATA.runs[s.id].daily.map(r => r[0]), ys: DATA.runs[s.id].daily.map(r => r[i]) });
   const L = i => SERIES.map(s => col(s, i));
   lineChart(document.getElementById('cum'), L(1), { H: 340, yFmt: v => fmtPct(v, 0), xFmt: fmtDay, xLabels: monthLabels, zero: true, endLabels: true, label: '누적 PnL' });
+  (DATA.fees || []).forEach((f, k) => {
+    const sec = document.createElement('section'); sec.className = 'card';
+    const head = document.createElement('div'); head.className = 'head';
+    const h = document.createElement('div'); h.append(txt('h2', '', `누적 PnL, 편도 비용 ${f}bps 적용 후 (북 대비 %)`), txt('div', 'rel', '거래 금액 × 비용을 매 봉 차감. 실행 전 기존 비용 설정 위에 추가로 적용.'));
+    const lg = document.createElement('div'); lg.className = 'legend'; for (const s of SERIES) { const sp = document.createElement('span'); const sw = document.createElement('i'); sw.className = 'sw'; sw.style.background = s.color; sp.append(sw, txt('span', '', s.name)); lg.append(sp); }
+    head.append(h, lg); const host = document.createElement('div'); host.className = 'chart'; sec.append(head, host); document.getElementById('fee-sections').append(sec);
+    lineChart(host, L(8 + k), { H: 300, yFmt: v => fmtPct(v, 0), xFmt: fmtDay, xLabels: monthLabels, zero: true, endLabels: true, label: `누적 PnL ${f}bps` });
+  });
   lineChart(document.getElementById('gross'), L(2), { H: 240, yFmt: v => fmtP(v, 0), xFmt: fmtDay, xLabels: monthLabels, yMin: 0, yMax: 120, label: '총 노출' });
   lineChart(document.getElementById('net'), L(3), { H: 240, yFmt: v => fmtPct(v, 0), xFmt: fmtDay, xLabels: monthLabels, zero: true, label: '순 노출' });
   lineChart(document.getElementById('turn'), L(4), { H: 260, yFmt: v => fmtP(v, 0), xFmt: fmtDay, xLabels: monthLabels, yMin: 0, label: '일 turnover' });
   lineChart(document.getElementById('hod'), SERIES.map(s => ({ s, xs: [...Array(24).keys()], ys: DATA.runs[s.id].hod })), { H: 240, yFmt: v => fmtP(v, 0), xFmt: h => `${h}:00 UTC`, xLabels: () => [...Array(24).keys()].filter(h => h % 3 === 0).map(h => [h, `${h}:00`]), yMin: 0, label: '시간대별 turnover' });
   const win = SERIES.map(s => { const d = DATA.runs[s.id].daily; const xs = [], ys = []; let w = 0, n = 0; for (let i = 0; i < d.length; i++) { w += d[i][5]; n += d[i][6]; if (i >= 30) { w -= d[i - 30][5]; n -= d[i - 30][6]; } xs.push(d[i][0]); ys.push(i >= 29 && n > 0 ? w / n * 100 : NaN); } return { s, xs, ys }; });
   lineChart(document.getElementById('win'), win, { H: 260, yFmt: v => fmtP(v, 0), xFmt: fmtDay, xLabels: monthLabels, yMin: 40, yMax: 60, label: '롤링 승률' });
+  // ---- per-symbol: contribution bars (all series) and cumulative lines (first series)
+  const symHost = document.getElementById('symbol-sections');
+  const firstSyms = DATA.runs[SERIES[0].id].symbols || {};
+  const symNames = Object.keys(firstSyms).sort((a, b) => firstSyms[b].total - firstSyms[a].total);
+  if (symNames.length) {
+    const sec = document.createElement('section'); sec.className = 'card';
+    const head = document.createElement('div'); head.className = 'head';
+    const h = document.createElement('div'); h.append(txt('h2', '', '종목별 PnL 기여 (북 대비 %, 전체 기간)'), txt('div', 'rel', `${SERIES[0].name} 기준 내림차순. 막대 위에 올리면 평균 |비중|도 표시.`));
+    const lg = document.createElement('div'); lg.className = 'legend'; for (const s of SERIES) { const sp = document.createElement('span'); const sw = document.createElement('i'); sw.className = 'sw'; sw.style.background = s.color; sp.append(sw, txt('span', '', s.name)); lg.append(sp); }
+    head.append(h, lg); const host = document.createElement('div'); host.className = 'chart'; sec.append(head, host); symHost.append(sec);
+    const W = 960, rowH = 6 * SERIES.length + 10, m = { l: 90, r: 60, t: 8, b: 28 }, H = m.t + m.b + rowH * symNames.length;
+    const vals = symNames.flatMap(n => SERIES.map(s => (DATA.runs[s.id].symbols[n] || {}).total || 0));
+    let v0 = Math.min(0, ...vals), v1 = Math.max(0, ...vals); const step = niceStep((v1 - v0) / 6 || 1); v0 = Math.floor(v0 / step) * step; v1 = Math.ceil(v1 / step) * step;
+    const X = v => m.l + (v - v0) / (v1 - v0 || 1) * (W - m.l - m.r);
+    const svg = svgEl('svg', { viewBox: `0 0 ${W} ${H}`, role: 'img', 'aria-label': '종목별 PnL 기여' });
+    for (let v = v0; v <= v1 + 1e-9; v += step) { svg.append(svgEl('line', { x1: X(v), x2: X(v), y1: m.t, y2: H - m.b, class: Math.abs(v) < 1e-9 ? 'zero' : 'grid' })); const tx = svgEl('text', { x: X(v), y: H - m.b + 16, 'text-anchor': 'middle' }); tx.textContent = fmtPct(v, 0); svg.append(tx); }
+    const tip = document.createElement('div'); tip.className = 'tip'; tip.hidden = true; host.append(tip);
+    symNames.forEach((name, gi) => {
+      const y0 = m.t + gi * rowH;
+      const lab = svgEl('text', { x: m.l - 8, y: y0 + rowH / 2 + 4, 'text-anchor': 'end', class: 'symlab' }); lab.textContent = name; svg.append(lab);
+      SERIES.forEach((s, si) => {
+        const rec = DATA.runs[s.id].symbols[name]; if (!rec) return;
+        const v = rec.total; const x = X(Math.min(0, v)), wdt = Math.max(Math.abs(X(v) - X(0)), 0.5); const y = y0 + 5 + si * 6;
+        const rect = svgEl('rect', { x, y, width: wdt, height: 4, rx: 2, fill: s.color, class: 'sbar', tabindex: 0 });
+        const show = () => { tip.replaceChildren(txt('div', 't', name)); const row = txt('div', 'r', ''); const k = txt('span', 'k', ''); const sw = document.createElement('i'); sw.className = 'key'; sw.style.background = s.color; k.append(sw, txt('span', '', s.name)); row.append(k, txt('b', '', `${fmtPct(v)}  ·  |w| ${rec.avg_abs_w.toFixed(1)}%`)); tip.append(row); tip.hidden = false; const r = svg.getBoundingClientRect(); tip.style.left = Math.min((X(Math.max(v, 0)) / W) * r.width + 12, r.width - 220) + 'px'; tip.style.top = ((y / H) * r.height - 40) + 'px'; };
+        rect.addEventListener('pointerenter', show); rect.addEventListener('focus', show); rect.addEventListener('pointerleave', () => { tip.hidden = true; }); rect.addEventListener('blur', () => { tip.hidden = true; });
+        svg.append(rect);
+      });
+    });
+    host.append(svg);
+
+    // cumulative lines per symbol for the first series: top 3 and bottom 3 in colour, rest muted
+    const sec2 = document.createElement('section'); sec2.className = 'card';
+    const head2 = document.createElement('div'); head2.className = 'head';
+    const h2 = document.createElement('div'); h2.append(txt('h2', '', `종목별 누적 PnL, ${SERIES[0].name} (북 대비 %)`), txt('div', 'rel', '기여 상위 3개와 하위 3개만 색으로 표시, 나머지는 회색.'));
+    const hi = symNames.slice(0, 3), lo = symNames.slice(-3);
+    const slotFor = {}; hi.forEach((n, i) => slotFor[n] = i + 1); lo.forEach((n, i) => slotFor[n] = 6 + i);
+    const lg2 = document.createElement('div'); lg2.className = 'legend';
+    for (const n of [...hi, ...lo]) { const sp = document.createElement('span'); const sw = document.createElement('i'); sw.className = 'sw'; sw.style.background = `var(--s${slotFor[n]})`; sp.append(sw, txt('span', '', n)); lg2.append(sp); }
+    head2.append(h2, lg2); const host2 = document.createElement('div'); host2.className = 'chart'; sec2.append(head2, host2); symHost.append(sec2);
+    const lines = symNames.map(n => ({ s: { name: n, short: n, color: slotFor[n] ? `var(--s${slotFor[n]})` : 'var(--grid)' }, xs: firstSyms[n].days.map(d => d[0]), ys: firstSyms[n].days.map(d => d[1]) }));
+    // draw muted first so coloured lines sit on top
+    lines.sort((a, b) => (slotFor[a.s.name] ? 1 : 0) - (slotFor[b.s.name] ? 1 : 0));
+    lineChart(host2, lines, { H: 340, yFmt: v => fmtPct(v, 0), xFmt: fmtDay, xLabels: monthLabels, zero: true, label: '종목별 누적 PnL' });
+  }
   const t = document.getElementById('table');
   const cols = ['설정', 'Sharpe', '연수익', '일 turnover', 'fitness', 'margin (bps)', 'MDD', 'mean IC', '봉 승률', '평균 총노출', '평균 순노출'];
   const thead = document.createElement('thead'); const hr = document.createElement('tr'); cols.forEach(c => hr.append(txt('th', '', c))); thead.append(hr); t.append(thead);
@@ -265,26 +345,29 @@ def main():
     ap.add_argument("--subtitle", default="")
     ap.add_argument("--note", action="append", default=[], help="bullet for the notes section (repeatable)")
     ap.add_argument("--booksize", type=float, default=1_000_000.0)
+    ap.add_argument("--fees", default="3,5", help="comma-separated one-way costs in bps for the after-fee cumulative PnL charts ('' to disable)")
     ap.add_argument("--out", required=True)
     ap.add_argument("series", nargs="+", help="label=path or label|short=path (max 8)")
     a = ap.parse_args()
     if len(a.series) > 8:
         raise SystemExit("at most 8 series (palette slots)")
+    fees = [float(x) for x in a.fees.split(",") if x.strip()]
     runs, series = {}, []
     for i, spec in enumerate(a.series):
         label, path = spec.split("=", 1)
         name, _, short = label.partition("|")
         sid = f"s{i + 1}"
-        runs[sid] = load_run(path, a.booksize)
+        # Per-symbol cumulative lines are drawn for the first series only; keep the page small.
+        runs[sid] = load_run(path, a.booksize, fees, keep_symbol_days=(i == 0))
         series.append({"id": sid, "name": name, "short": short or name, "slot": i + 1})
     os.makedirs(a.out, exist_ok=True)
-    json.dump({"booksize": a.booksize, "series": series, "runs": runs}, open(os.path.join(a.out, "data.json"), "w"), separators=(",", ":"))
+    json.dump({"booksize": a.booksize, "fees": fees, "series": series, "runs": runs}, open(os.path.join(a.out, "data.json"), "w"), separators=(",", ":"))
     esc = lambda s: s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     notes = ""
     if a.note:
         notes = '<section class="card"><h2>읽는 법</h2><ul class="notes">' + "".join(f"<li>{esc(n)}</li>" for n in a.note) + "</ul></section>"
-    light = " ".join(f"--s{i + 1}: {PALETTE[i][0]};" for i in range(len(series)))
-    dark = " ".join(f"--s{i + 1}: {PALETTE[i][1]};" for i in range(len(series)))
+    light = " ".join(f"--s{i + 1}: {PALETTE[i][0]};" for i in range(len(PALETTE)))
+    dark = " ".join(f"--s{i + 1}: {PALETTE[i][1]};" for i in range(len(PALETTE)))
     html = (TEMPLATE.replace("__TITLE__", esc(a.title)).replace("__SUBTITLE__", esc(a.subtitle)).replace("__NOTES__", notes)
             .replace("__LIGHT_SLOTS__", light).replace("__DARK_SLOTS__", dark))
     open(os.path.join(a.out, "index.html"), "w").write(html)
