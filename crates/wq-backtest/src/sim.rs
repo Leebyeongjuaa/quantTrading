@@ -201,6 +201,24 @@ impl GateState {
     }
 }
 
+/// Advances the price-distance accumulators by one bar without trading (used on bars between
+/// scheduled rebalances, so a gate measured over the whole hour sees every 5m return).
+pub fn gate_advance(state: &mut GateState, mask: &[bool], ret_now: &[f64]) {
+    let (mut sum, mut cnt) = (0.0, 0usize);
+    for i in 0..ret_now.len() {
+        if ret_now[i].is_finite() {
+            state.per[i] += ret_now[i].abs();
+            if mask[i] {
+                sum += ret_now[i].abs();
+                cnt += 1;
+            }
+        }
+    }
+    if cnt > 0 {
+        state.all += sum / cnt as f64;
+    }
+}
+
 /// Turns target weights into held weights for one bar.
 ///
 /// The gate decides whether a trade is allowed (see [`GateMode`] and [`DistanceScope`]).
@@ -456,9 +474,13 @@ pub fn simulate(panel: &Panel, alpha: &Mat, s: &Settings) -> SimResult {
                 *v = history.iter().map(|h| h[i]).sum::<f64>() / k;
             }
         }
-        let row = if scheduled && (s.trade_distance > 0.0 || s.entry_speed < 1.0) {
+        let gated = s.trade_distance > 0.0 || s.entry_speed < 1.0;
+        let row = if scheduled && gated {
             gate_weights(&row, &prev, &mask, panel.returns.row(ti), &mut gate, s)
         } else {
+            if gated {
+                gate_advance(&mut gate, &mask, panel.returns.row(ti));
+            }
             row
         };
 
@@ -549,6 +571,16 @@ mod tests {
             rebalance_ms: 0,
             smooth: 0,
         }
+    }
+
+    #[test]
+    fn price_distance_accumulates_between_scheduled_bars() {
+        let mut g = GateState::new(2);
+        gate_advance(&mut g, &[true, true], &[0.01, 0.03]);
+        gate_advance(&mut g, &[true, false], &[0.01, f64::NAN]);
+        assert!((g.per[0] - 0.02).abs() < 1e-12);
+        assert!((g.per[1] - 0.03).abs() < 1e-12);
+        assert!((g.all - 0.03).abs() < 1e-12); // mean 0.02 then 0.01
     }
 
     #[test]
