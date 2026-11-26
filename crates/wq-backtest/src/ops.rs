@@ -115,6 +115,14 @@ pub const OPERATORS: &[(&str, &str)] = &[
         "ts_resid(x, d) ts_resid_z(x, d)",
         "last point's residual from the OLS trend line over d bars (z: / residual std)",
     ),
+    (
+        "ts_slope(x, d) ts_r2(x, d)",
+        "OLS trend slope per bar / R² of the fit over d bars",
+    ),
+    (
+        "keep_if(x, cond)",
+        "x where cond != 0, else NaN (drops the name from the book)",
+    ),
 ];
 
 fn valid(w: &[f64]) -> Vec<f64> {
@@ -523,6 +531,48 @@ impl<'a> Evaluator<'a> {
                     }
                 }
                 out
+            }
+            "keep_if" => {
+                let m = x(0)?;
+                let c = x(1)?;
+                m.zip(&c, |v, cv| {
+                    if cv.is_finite() && cv != 0.0 {
+                        v
+                    } else {
+                        f64::NAN
+                    }
+                })
+            }
+            "ts_slope" | "ts_r2" => {
+                let d = self.arg_window(name, args, kwargs, 1)?;
+                let want_r2 = name == "ts_r2";
+                ts_apply(&x(0)?, d, move |w| {
+                    let pts: Vec<(f64, f64)> = w
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, v)| v.is_finite())
+                        .map(|(i, v)| (i as f64, *v))
+                        .collect();
+                    if pts.len() < min_count(d).max(3) {
+                        return f64::NAN;
+                    }
+                    let n = pts.len() as f64;
+                    let mx = pts.iter().map(|p| p.0).sum::<f64>() / n;
+                    let my = pts.iter().map(|p| p.1).sum::<f64>() / n;
+                    let sxx: f64 = pts.iter().map(|p| (p.0 - mx).powi(2)).sum();
+                    let sxy: f64 = pts.iter().map(|p| (p.0 - mx) * (p.1 - my)).sum();
+                    let syy: f64 = pts.iter().map(|p| (p.1 - my).powi(2)).sum();
+                    if sxx <= 0.0 {
+                        return f64::NAN;
+                    }
+                    if !want_r2 {
+                        return sxy / sxx;
+                    }
+                    if syy <= 0.0 {
+                        return f64::NAN;
+                    }
+                    (sxy * sxy) / (sxx * syy)
+                })
             }
             "ts_resid" | "ts_resid_z" => {
                 let d = self.arg_window(name, args, kwargs, 1)?;
@@ -1023,6 +1073,27 @@ mod tests {
         let h = hump(&x, 0.01);
         assert!(close(h.get(1, 0), 1.0));
         assert!(close(h.get(2, 0), 2.0));
+    }
+
+    #[test]
+    fn slope_r2_and_keep_if() {
+        let p = Panel::from_series(vec![
+            ("L".into(), bars(0, &[10.0, 11.0, 12.0, 13.0, 14.0, 15.0])),
+            ("N".into(), bars(0, &[10.0, 12.0, 9.0, 13.0, 8.0, 14.0])),
+        ])
+        .unwrap();
+        let s = evaluate(&p, &parse("ts_slope(close, 6)").unwrap()).unwrap();
+        assert!(close(s.get(5, 0), 1.0));
+        let r2 = evaluate(&p, &parse("ts_r2(close, 6)").unwrap()).unwrap();
+        assert!(close(r2.get(5, 0), 1.0));
+        assert!(r2.get(5, 1) < 0.5 && r2.get(5, 1) >= 0.0);
+        let k = evaluate(
+            &p,
+            &parse("keep_if(ts_slope(close, 6), ts_r2(close, 6) >= 0.9)").unwrap(),
+        )
+        .unwrap();
+        assert!(close(k.get(5, 0), 1.0));
+        assert!(k.get(5, 1).is_nan());
     }
 
     #[test]
