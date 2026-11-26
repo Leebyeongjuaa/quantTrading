@@ -80,9 +80,12 @@ struct SimArgs {
     /// this many bars (0 = off). Applied after scaling, before the gate.
     #[arg(long, default_value_t = 0)]
     smooth: usize,
-    /// Noise floor on |alpha|: smaller signals keep their previous weight (alpha units, 0 = off).
+    /// Signal noise floor (alpha units, 0 = off): portfolio scope holds the book when the mean
+    /// |alpha| over the universe is below it; instrument scope holds only the quiet names.
     #[arg(long, default_value_t = 0.0)]
     min_signal: f64,
+    #[arg(long, value_enum, default_value = "portfolio")]
+    min_signal_scope: DistanceScope,
     /// Skip the rebalance when the mean |alpha - alpha at last trade| over significant names is
     /// below this (alpha units, 0 = off).
     #[arg(long, default_value_t = 0.0)]
@@ -116,6 +119,7 @@ impl SimArgs {
                 .map(|r| parse_bar(r).expect("bad --rebalance, use e.g. 1h"))
                 .unwrap_or(0),
             min_signal: self.min_signal,
+            min_signal_scope: self.min_signal_scope,
             min_signal_change: self.min_signal_change,
             smooth: self.smooth,
         }

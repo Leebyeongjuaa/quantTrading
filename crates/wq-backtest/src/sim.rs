@@ -96,9 +96,12 @@ pub struct Settings {
     /// (e.g. 3_600_000 = on the hour); hold in between. 0 = every bar. With `delay`, the
     /// signal is taken at that close and executed `delay` bars later.
     pub rebalance_ms: i64,
-    /// Signal noise floor: names whose |alpha| is below this keep their previous weight and
-    /// take no part in the new book (0 = off). In the alpha's own units.
+    /// Signal noise floor (alpha units, 0 = off). `Portfolio` scope: hold the whole book when
+    /// the mean |alpha| over the universe is below it (the market is quiet). `Instrument`
+    /// scope: names whose own |alpha| is below it keep their previous weight and take no part
+    /// in the new book.
     pub min_signal: f64,
+    pub min_signal_scope: DistanceScope,
     /// Signal-change floor: skip the whole rebalance when the mean |alpha - alpha at the last
     /// executed trade| over the significant names is below this (0 = off). Alpha units.
     pub min_signal_change: f64,
@@ -127,6 +130,7 @@ impl Default for Settings {
             gate_mode: GateMode::Price,
             rebalance_ms: 0,
             min_signal: 0.0,
+            min_signal_scope: DistanceScope::Portfolio,
             min_signal_change: 0.0,
             smooth: 0,
         }
@@ -206,8 +210,21 @@ pub fn signal_filter(
     s: &Settings,
 ) -> Option<Vec<f64>> {
     let n = alpha.len();
+    let per_name = s.min_signal_scope == DistanceScope::Instrument;
+    if !per_name && s.min_signal > 0.0 {
+        let (mut sum, mut cnt) = (0.0, 0usize);
+        for i in 0..n {
+            if mask[i] && alpha[i].is_finite() {
+                sum += alpha[i].abs();
+                cnt += 1;
+            }
+        }
+        if cnt == 0 || sum / (cnt as f64) < s.min_signal {
+            return None;
+        }
+    }
     let significant: Vec<bool> = (0..n)
-        .map(|i| mask[i] && alpha[i].is_finite() && alpha[i].abs() >= s.min_signal)
+        .map(|i| mask[i] && alpha[i].is_finite() && (!per_name || alpha[i].abs() >= s.min_signal))
         .collect();
     let k = significant.iter().filter(|b| **b).count();
     if k == 0 {
@@ -644,15 +661,41 @@ mod tests {
             gate_mode: GateMode::Price,
             rebalance_ms: 0,
             min_signal: 0.0,
+            min_signal_scope: DistanceScope::Portfolio,
             min_signal_change: 0.0,
             smooth: 0,
         }
     }
 
     #[test]
+    fn signal_filter_portfolio_scope_holds_quiet_markets() {
+        let mut s = settings();
+        s.min_signal = 0.01; // mean |alpha| must reach 1%
+        s.min_signal_scope = DistanceScope::Portfolio;
+        s.min_signal_change = 0.0;
+        s.truncation = 0.0;
+        let mask = [true; 4];
+        let mut last = vec![0.0; 4];
+        // mean |alpha| = 0.5%: quiet, hold.
+        assert!(signal_filter(&[0.01, -0.01, 0.0, 0.0], &[0.0; 4], &mask, &mut last, &s).is_none());
+        // mean 1.25%: trade with every name (no per-name exclusion).
+        let w = signal_filter(
+            &[0.03, -0.01, 0.005, -0.005],
+            &[0.0; 4],
+            &mask,
+            &mut last,
+            &s,
+        )
+        .unwrap();
+        assert!(w.iter().all(|v| *v != 0.0));
+        assert!((w.iter().sum::<f64>()).abs() < 1e-9);
+    }
+
+    #[test]
     fn signal_filter_holds_noise_and_unchanged_books() {
         let mut s = settings();
         s.min_signal = 0.01;
+        s.min_signal_scope = DistanceScope::Instrument;
         s.min_signal_change = 0.005;
         s.truncation = 0.0;
         let mask = [true; 4];
