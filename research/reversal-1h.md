@@ -133,6 +133,12 @@ mean |alpha − alpha at the last trade| over the significant names is below δ)
 - Break-even cost moves from 1.5 to about 2.3 bps (26 months) / 3.2 bps (recent 180 days).
   Still below a taker's cost on the alt names that produce the PnL.
 
+## Artifacts
+
+- Gate comparison, 1h panel (decay-4 era): https://claude.ai/artifact/GxAnRXwTUhuTA8rivmXRFn
+- Latency test, 5m panel with hourly rebalance: https://claude.ai/artifact/4UGt1Qg18FequA6jXw4pTT
+- Successor strategy (24h trend residual): `reversal-24h-trend.md`
+
 ## Open items
 
 1. Maker execution model (resting limit orders, fill probability), which is the only path left.

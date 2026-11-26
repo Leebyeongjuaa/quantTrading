@@ -44,6 +44,20 @@ Median |residual| is 0.69% (p25 0.30%, p75 1.38%).
 The change floor δ = 1% does more than the noise floor here (the residual already suppresses
 small moves). Break-even one-way cost: 2.6 bps unfiltered, 3.5-3.7 bps with δ 1%.
 
+## Artifact
+
+Comparison page (1h panel, 26 months, delay 0): https://claude.ai/artifact/Bmhzys8WASsoQPAQtGfPtq
+Series: residual 24h, residual 24h + δ 1%, residual 48h, raw 1h return. Built with
+`tools/wq-report/build.py` from `wq-bt run --out` directories:
+
+```bash
+wq-bt run "-ts_resid(log(close), 24)" --data-dir data/ --delay 0 --decay 0 --out runs/r24
+wq-bt run "-ts_resid(log(close), 24)" --data-dir data/ --delay 0 --decay 0 --min-signal-change 0.01 --out runs/r24f
+wq-bt run "-ts_resid(log(close), 48)" --data-dir data/ --delay 0 --decay 0 --out runs/r48
+wq-bt run "-returns" --data-dir data/ --delay 0 --decay 0 --out runs/ret
+python3 tools/wq-report/build.py --title "24h 추세잔차 리버설" --out report/ "잔차 24h=runs/r24" "잔차 24h + δ1%=runs/r24f" "잔차 48h=runs/r48" "1h 수익률 (기존)=runs/ret"
+```
+
 ## Verdict
 
 Better cost structure than the raw 1h return at the same horizon: break-even 2.6-3.7 bps vs

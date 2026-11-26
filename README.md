@@ -164,7 +164,8 @@ hour-of-day turnover, rolling win ratio, per-symbol contribution, tables). The `
 ## Research notes
 
 Alpha write-ups live in `research/` (one Markdown file per signal, with settings, results and
-reproduction commands). Start with `research/reversal-1h.md`.
+reproduction commands). Start with `research/reversal-1h.md`, then
+`research/reversal-24h-trend.md` (its successor) and `research/major-minor.md`.
 
 ## Verifying the signer against Go
 
