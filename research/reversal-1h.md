@@ -80,24 +80,29 @@ small per name; test N=50 next, with per-name costs.
   leave +0.6..3.9% average and +-10% on a day. Re-neutralize after truncation in production.
 - Monthly PnL is uneven; 2026-01 and 2026-02 are the worst months for most settings.
 
-## Latency test on 5m bars (added 2026-11-25)
+## Latency test on 5m bars (added 2026-11-25, corrected 2026-11-26)
 
 Panel: same 30 names, 5m bars, 2026-05-29 .. 2026-11-25 (51,840 bars). Signal
-`-ts_returns(close, 12)` (trailing 1h return), rebalanced every 5m, delay in 5m bars.
+`-ts_returns(close, 12)` (trailing 1h return) computed at the hour close, executed `delay`
+5m bars later and held until the next hour (`--rebalance 1h`), so turnover matches the 1h panel.
 
-| delay | Sharpe | annual return | turnover/day | margin | mean IC |
-|---|---|---|---|---|---|
-| 0 min | 40.1 | +1258% | 12936% | 2.66 bps | 0.051 |
-| 5 min | 17.1 | +527% | 12936% | 1.12 bps | 0.022 |
-| 15 min | 9.3 | +279% | 12936% | 0.59 bps | 0.012 |
-| 60 min | 4.3 | +124% | 12936% | 0.26 bps | 0.006 |
+| execution delay | Sharpe | annual return | turnover/day | margin | mean IC | 3 bps Sharpe |
+|---|---|---|---|---|---|---|
+| 0 min | 10.4 | +314% | 3402% | 2.53 bps | 0.051 | -1.9 |
+| 5 min | 8.9 | +264% | 3402% | 2.13 bps | 0.022 | -3.6 |
+| 15 min | 4.7 | +138% | 3402% | 1.11 bps | 0.012 | -7.9 |
+| 60 min | 1.4 | +39% | 3402% | 0.32 bps | 0.006 | |
 
-- The edge halves every ~5-10 minutes. At 5 min delay with 3 bps cost: Sharpe -29.
-- Delay 0 on 5m closes is inflated by bid-ask bounce (a close at the bid followed by one at the
-  ask looks like reversal). Treat the 0-min row as an upper bound, not a forecast.
-- 5% universe-mean price gate at 5 min delay: Sharpe 2.4, turnover 1414%, still negative at 3 bps.
-- Conclusion: this is a liquidity-provision signal. It pays only to whoever is already resting
-  at the touch; a taker cannot harvest it at any gate setting tested.
+- Re-trading every 5m (the first version of this test) gave Sharpe 40 / 17 / 9 / 4 with
+  turnover 12,936%/day; that was a different strategy, not the intended "hourly signal,
+  late fill". Numbers above supersede it.
+- The 180-day window is a strong one for the alpha (the 1h panel's 2026 Sharpe is 8.4 vs 5.9
+  over 26 months), so compare rows, not levels.
+- Delay 0 on 5m closes is inflated by bid-ask bounce. Realistic expectation sits between the
+  5 and 15 minute rows: margin 1-2 bps, which no taker fee schedule clears.
+- Per-symbol contribution: almost all PnL comes from thin alts (XPL, ZRO, MON, VVV, 1000PEPE);
+  BTC/ETH/SOL contribute about zero. Those names also have the widest spreads.
+- Conclusion unchanged: a liquidity-provision signal; harvestable only by resting orders.
 
 ## Open items
 
