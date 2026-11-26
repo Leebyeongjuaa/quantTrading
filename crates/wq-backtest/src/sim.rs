@@ -92,6 +92,10 @@ pub struct Settings {
     pub exit_speed: f64,
     pub distance_scope: DistanceScope,
     pub gate_mode: GateMode,
+    /// Rebalance only when the signal bar closes on a multiple of this many milliseconds
+    /// (e.g. 3_600_000 = on the hour); hold in between. 0 = every bar. With `delay`, the
+    /// signal is taken at that close and executed `delay` bars later.
+    pub rebalance_ms: i64,
     /// Position smoothing: the target weights are replaced by their trailing simple moving
     /// average over this many bars (0/1 = off). Applied after neutralization and scaling, so
     /// gross exposure can fall below the book when targets flip; it is not rescaled.
@@ -115,6 +119,7 @@ impl Default for Settings {
             exit_speed: 0.0,
             distance_scope: DistanceScope::Portfolio,
             gate_mode: GateMode::Price,
+            rebalance_ms: 0,
             smooth: 0,
         }
     }
@@ -391,6 +396,9 @@ pub fn simulate(panel: &Panel, alpha: &Mat, s: &Settings) -> SimResult {
             None => continue,
         };
         let mut row: Vec<f64> = decayed.row(src).to_vec();
+        // Hold between scheduled rebalances: the signal bar must close on the schedule.
+        let scheduled = s.rebalance_ms <= 0
+            || (panel.ts[src] + panel.interval_ms).rem_euclid(s.rebalance_ms) == 0;
         // Universe: needs a tradeable next return (we must be able to hold the instrument).
         let next_ret: Vec<f64> = if ti + 1 < t {
             panel.returns.row(ti + 1).to_vec()
@@ -428,8 +436,17 @@ pub fn simulate(panel: &Panel, alpha: &Mat, s: &Settings) -> SimResult {
                 .collect::<Vec<_>>(),
             &next_ret,
         );
-        weights_from_alpha(&mut row, &mask, s);
-        if s.smooth > 1 {
+        if !scheduled {
+            // Keep yesterday's book, but drop names that left the universe.
+            row = prev
+                .iter()
+                .zip(&mask)
+                .map(|(w, m)| if *m { *w } else { 0.0 })
+                .collect();
+        } else {
+            weights_from_alpha(&mut row, &mask, s);
+        }
+        if scheduled && s.smooth > 1 {
             history.push_back(row.clone());
             if history.len() > s.smooth {
                 history.pop_front();
@@ -439,7 +456,7 @@ pub fn simulate(panel: &Panel, alpha: &Mat, s: &Settings) -> SimResult {
                 *v = history.iter().map(|h| h[i]).sum::<f64>() / k;
             }
         }
-        let row = if s.trade_distance > 0.0 || s.entry_speed < 1.0 {
+        let row = if scheduled && (s.trade_distance > 0.0 || s.entry_speed < 1.0) {
             gate_weights(&row, &prev, &mask, panel.returns.row(ti), &mut gate, s)
         } else {
             row
@@ -529,8 +546,26 @@ mod tests {
             exit_speed: 0.0,
             distance_scope: DistanceScope::Instrument,
             gate_mode: GateMode::Price,
+            rebalance_ms: 0,
             smooth: 0,
         }
+    }
+
+    #[test]
+    fn scheduled_rebalance_holds_between_closes() {
+        // Hourly bars in the test panel: a 3h schedule trades every third bar only.
+        let p = panel();
+        let a = evaluate(&p, &parse("-ts_delta(close, 1)").unwrap()).unwrap();
+        let mut s = settings();
+        s.rebalance_ms = 3 * 3_600_000;
+        let r = simulate(&p, &a, &s);
+        let trading_bars: Vec<usize> = (0..p.t()).filter(|&t| r.turnover[t] > 0.0).collect();
+        assert!(trading_bars
+            .iter()
+            .all(|&t| (p.ts[t] + p.interval_ms) % s.rebalance_ms == 0));
+        assert!(!trading_bars.is_empty());
+        let base = simulate(&p, &a, &settings());
+        assert!(r.turnover.iter().sum::<f64>() < base.turnover.iter().sum::<f64>());
     }
 
     #[test]

@@ -130,7 +130,10 @@ gate stays closed (0 = hold). The gate measures either price travel (`--gate pri
 with the number of instruments) or signal drift (`--gate signal`: pending turnover
 `sum|target - held| / booksize`, or `--gate signal-change`: `sum|target_t - target_{t-1}|`
 accumulated since the last trade). `--smooth N` holds the trailing N-bar simple moving average
-of the scaled target weights (position smoothing, applied before the gate). `grid` sweeps
+of the scaled target weights (position smoothing, applied before the gate). `--rebalance 1h`
+trades only when the signal bar closes on the hour and holds in between, so on a 5m panel
+`--delay 1 --rebalance 1h` means "signal at the hour, executed 5 minutes later, held for the
+hour". `grid` sweeps
 distance × speed × exit with decay.
 
 Simulation settings mirror BRAIN: `--delay` (1 = alpha from the previous close), `--decay`

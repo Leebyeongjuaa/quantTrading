@@ -19,6 +19,8 @@ new page takes minutes, not an hour.
    `pnl.csv` must contain `long_notional`/`short_notional` and the run directory must have
    `symbol_daily.csv` (any build after 2026-11-26 writes both; older runs lose only the
    per-symbol charts).
+   On a fine panel (5m) use `--rebalance 1h` (or the signal's own horizon) unless you really
+   mean to re-trade every bar; `--delay N` then measures execution latency after the close.
    Up to 8 runs per page (palette slots). Put runs that share a time axis on one page; do not
    mix a 26-month 1h panel with a 180-day 5m panel on the same page.
 

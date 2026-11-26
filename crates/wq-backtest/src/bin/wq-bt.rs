@@ -80,6 +80,10 @@ struct SimArgs {
     /// this many bars (0 = off). Applied after scaling, before the gate.
     #[arg(long, default_value_t = 0)]
     smooth: usize,
+    /// Rebalance only when the signal bar closes on this schedule (e.g. 1h, 4h, 1d); hold in
+    /// between. Combine with --delay to execute N bars after the scheduled close.
+    #[arg(long)]
+    rebalance: Option<String>,
 }
 
 impl SimArgs {
@@ -99,6 +103,11 @@ impl SimArgs {
             exit_speed: self.exit_speed,
             distance_scope: self.distance_scope,
             gate_mode: self.gate,
+            rebalance_ms: self
+                .rebalance
+                .as_deref()
+                .map(|r| parse_bar(r).expect("bad --rebalance, use e.g. 1h"))
+                .unwrap_or(0),
             smooth: self.smooth,
         }
     }
