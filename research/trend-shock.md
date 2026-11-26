@@ -53,9 +53,19 @@ Does the trend condition matter? (neutral, residual weight, 48h, z ≥ 2)
 - Compared with the unconditional 24h residual reversal (Sharpe 4.0, 22% DD), this is a subset
   with lower Sharpe but shallower drawdown (16%) and a clearer story.
 
+## 5m panel (180 days, hourly rebalance, 5-minute fill, neutral)
+
+| variant | Sharpe 0 bps | annual ret | turnover/day | margin | max DD | 2 bps Sharpe |
+|---|---|---|---|---|---|---|
+| 48h, z ≥ 2, residual weight | 3.78 | +127% | 1142% | 3.05 | 8% | 1.30 |
+| 48h, z ≥ 1.5, slope weight | 2.87 | +118% | 1889% | 1.70 | 16% | -0.50 |
+
+The residual-weighted version holds up with a 5-minute fill (break-even 3 bps); the
+slope-weighted one does not. Same ordering as the 1h panel.
+
 ## Open items
 
-1. 5m panel with hourly rebalance and 5-minute fill (running).
+1. ~~5m panel with hourly rebalance and 5-minute fill.~~ Done above.
 2. Ease entries: scale into the position over a few bars instead of the full jump, and hold a
    minimum number of bars after the shock clears, to cut the entry/exit churn.
 3. Combine with the 24h residual reversal as a conviction overlay (larger weight when the shock
