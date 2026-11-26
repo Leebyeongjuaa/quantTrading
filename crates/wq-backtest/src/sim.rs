@@ -96,6 +96,12 @@ pub struct Settings {
     /// (e.g. 3_600_000 = on the hour); hold in between. 0 = every bar. With `delay`, the
     /// signal is taken at that close and executed `delay` bars later.
     pub rebalance_ms: i64,
+    /// Signal noise floor: names whose |alpha| is below this keep their previous weight and
+    /// take no part in the new book (0 = off). In the alpha's own units.
+    pub min_signal: f64,
+    /// Signal-change floor: skip the whole rebalance when the mean |alpha - alpha at the last
+    /// executed trade| over the significant names is below this (0 = off). Alpha units.
+    pub min_signal_change: f64,
     /// Position smoothing: the target weights are replaced by their trailing simple moving
     /// average over this many bars (0/1 = off). Applied after neutralization and scaling, so
     /// gross exposure can fall below the book when targets flip; it is not rescaled.
@@ -120,6 +126,8 @@ impl Default for Settings {
             distance_scope: DistanceScope::Portfolio,
             gate_mode: GateMode::Price,
             rebalance_ms: 0,
+            min_signal: 0.0,
+            min_signal_change: 0.0,
             smooth: 0,
         }
     }
@@ -151,6 +159,11 @@ pub struct SimResult {
 
 /// Builds the weight row from an alpha row (in place): mask → neutralize → scale → truncate.
 pub fn weights_from_alpha(alpha: &mut [f64], mask: &[bool], s: &Settings) {
+    weights_from_alpha_budget(alpha, mask, s, s.booksize)
+}
+
+/// Like [`weights_from_alpha`] but scales the book to `budget` dollars gross.
+pub fn weights_from_alpha_budget(alpha: &mut [f64], mask: &[bool], s: &Settings, budget: f64) {
     for (a, m) in alpha.iter_mut().zip(mask) {
         if !*m {
             *a = f64::NAN;
@@ -167,7 +180,7 @@ pub fn weights_from_alpha(alpha: &mut [f64], mask: &[bool], s: &Settings) {
             }
         }
     }
-    scale_row(alpha, s.booksize);
+    scale_row(alpha, budget);
     if s.truncation > 0.0 && s.truncation < 1.0 {
         truncate_row(alpha, s.truncation);
     }
@@ -176,6 +189,59 @@ pub fn weights_from_alpha(alpha: &mut [f64], mask: &[bool], s: &Settings) {
             *a = 0.0;
         }
     }
+}
+
+/// Signal-level turnover filter (applied before weights are built).
+///
+/// 1. Names with `|alpha| < min_signal` are noise: they keep `prev` and are excluded from the
+///    new book. 2. If the mean `|alpha - last_traded_alpha|` over the significant names is
+///    below `min_signal_change`, nothing trades. Otherwise the significant names are
+///    neutralized and scaled to the gross budget left after the held names, and their
+///    `last_alpha` is updated. Returns `None` when the bar should hold the previous book.
+pub fn signal_filter(
+    alpha: &[f64],
+    prev: &[f64],
+    mask: &[bool],
+    last_alpha: &mut [f64],
+    s: &Settings,
+) -> Option<Vec<f64>> {
+    let n = alpha.len();
+    let significant: Vec<bool> = (0..n)
+        .map(|i| mask[i] && alpha[i].is_finite() && alpha[i].abs() >= s.min_signal)
+        .collect();
+    let k = significant.iter().filter(|b| **b).count();
+    if k == 0 {
+        return None;
+    }
+    if s.min_signal_change > 0.0 {
+        let change: f64 = (0..n)
+            .filter(|&i| significant[i])
+            .map(|i| (alpha[i] - last_alpha[i]).abs())
+            .sum::<f64>()
+            / k as f64;
+        if change < s.min_signal_change {
+            return None;
+        }
+    }
+    let held_gross: f64 = (0..n)
+        .filter(|&i| mask[i] && !significant[i])
+        .map(|i| prev[i].abs())
+        .sum();
+    let budget = (s.booksize - held_gross).max(0.0);
+    let mut fresh: Vec<f64> = alpha.to_vec();
+    weights_from_alpha_budget(&mut fresh, &significant, s, budget);
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        if !mask[i] {
+            out.push(0.0);
+        } else if significant[i] {
+            out.push(fresh[i]);
+            last_alpha[i] = alpha[i];
+        } else {
+            out.push(prev[i]);
+        }
+    }
+    Some(out)
 }
 
 /// Accumulated price distance since the last trade: per instrument plus one shared value.
@@ -404,6 +470,7 @@ pub fn simulate(panel: &Panel, alpha: &Mat, s: &Settings) -> SimResult {
     };
     let mut prev: Vec<f64> = vec![0.0; n];
     let mut gate = GateState::new(n);
+    let mut last_alpha: Vec<f64> = vec![0.0; n];
     let mut static_set: Option<std::collections::HashSet<usize>> = None;
     let mut history: std::collections::VecDeque<Vec<f64>> = std::collections::VecDeque::new();
 
@@ -454,13 +521,20 @@ pub fn simulate(panel: &Panel, alpha: &Mat, s: &Settings) -> SimResult {
                 .collect::<Vec<_>>(),
             &next_ret,
         );
-        if !scheduled {
-            // Keep yesterday's book, but drop names that left the universe.
-            row = prev
-                .iter()
+        let hold_book = |prev: &[f64]| -> Vec<f64> {
+            prev.iter()
                 .zip(&mask)
                 .map(|(w, m)| if *m { *w } else { 0.0 })
-                .collect();
+                .collect()
+        };
+        if !scheduled {
+            // Keep yesterday's book, but drop names that left the universe.
+            row = hold_book(&prev);
+        } else if s.min_signal > 0.0 || s.min_signal_change > 0.0 {
+            row = match signal_filter(&row, &prev, &mask, &mut last_alpha, s) {
+                Some(w) => w,
+                None => hold_book(&prev),
+            };
         } else {
             weights_from_alpha(&mut row, &mask, s);
         }
@@ -569,8 +643,44 @@ mod tests {
             distance_scope: DistanceScope::Instrument,
             gate_mode: GateMode::Price,
             rebalance_ms: 0,
+            min_signal: 0.0,
+            min_signal_change: 0.0,
             smooth: 0,
         }
+    }
+
+    #[test]
+    fn signal_filter_holds_noise_and_unchanged_books() {
+        let mut s = settings();
+        s.min_signal = 0.01;
+        s.min_signal_change = 0.005;
+        s.truncation = 0.0;
+        let mask = [true; 4];
+        let mut last = vec![0.0; 4];
+        // Two strong names, two noise names: book built from the strong pair only.
+        let w1 = signal_filter(
+            &[0.03, -0.03, 0.001, -0.002],
+            &[0.0; 4],
+            &mask,
+            &mut last,
+            &s,
+        )
+        .unwrap();
+        assert_eq!(w1, vec![50.0, -50.0, 0.0, 0.0]);
+        assert_eq!(last, vec![0.03, -0.03, 0.0, 0.0]);
+        // Same strong signals (change 0.001 < 0.005), noise names still noise: hold everything.
+        assert!(signal_filter(&[0.031, -0.029, 0.002, 0.0], &w1, &mask, &mut last, &s).is_none());
+        // A new significant name counts as change (mean (0.001+0.001+0.02)/3 >= 0.005): trade.
+        assert!(signal_filter(&[0.031, -0.029, 0.02, 0.0], &w1, &mask, &mut last, &s).is_some());
+        let mut last = vec![0.03, -0.03, 0.0, 0.0];
+        // Strong flip: trade; the name that is now noise keeps its old weight and the
+        // significant names get the remaining budget.
+        let w3 = signal_filter(&[-0.03, 0.0, 0.02, -0.02], &w1, &mask, &mut last, &s).unwrap();
+        assert_eq!(w3[1], -50.0); // held (noise now)
+        assert!((w3[0] + w3[2] + w3[3]).abs() < 1e-9); // neutral among traded names
+        assert!(((w3[0].abs() + w3[2].abs() + w3[3].abs()) - 50.0).abs() < 1e-9); // budget 100 - 50
+                                                                                  // All noise: hold.
+        assert!(signal_filter(&[0.001; 4], &w3, &mask, &mut last, &s).is_none());
     }
 
     #[test]

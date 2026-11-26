@@ -80,6 +80,13 @@ struct SimArgs {
     /// this many bars (0 = off). Applied after scaling, before the gate.
     #[arg(long, default_value_t = 0)]
     smooth: usize,
+    /// Noise floor on |alpha|: smaller signals keep their previous weight (alpha units, 0 = off).
+    #[arg(long, default_value_t = 0.0)]
+    min_signal: f64,
+    /// Skip the rebalance when the mean |alpha - alpha at last trade| over significant names is
+    /// below this (alpha units, 0 = off).
+    #[arg(long, default_value_t = 0.0)]
+    min_signal_change: f64,
     /// Rebalance only when the signal bar closes on this schedule (e.g. 1h, 4h, 1d); hold in
     /// between. Combine with --delay to execute N bars after the scheduled close.
     #[arg(long)]
@@ -108,6 +115,8 @@ impl SimArgs {
                 .as_deref()
                 .map(|r| parse_bar(r).expect("bad --rebalance, use e.g. 1h"))
                 .unwrap_or(0),
+            min_signal: self.min_signal,
+            min_signal_change: self.min_signal_change,
             smooth: self.smooth,
         }
     }
@@ -160,6 +169,12 @@ enum Cmd {
         /// Exit (fade-out) speeds while the gate is closed.
         #[arg(long, value_delimiter = ',', default_value = "0")]
         exits: Vec<f64>,
+        /// Signal noise floors (|alpha| below = hold that name).
+        #[arg(long, value_delimiter = ',', default_value = "0")]
+        min_signals: Vec<f64>,
+        /// Signal-change floors (mean |Δalpha| below = hold the book).
+        #[arg(long, value_delimiter = ',', default_value = "0")]
+        min_changes: Vec<f64>,
         /// Sort key: fitness, sharpe, return, margin.
         #[arg(long, default_value = "fitness")]
         sort: String,
@@ -407,6 +422,8 @@ fn main() -> Result<()> {
             speeds,
             decays,
             exits,
+            min_signals,
+            min_changes,
             sort,
         } => {
             let panel = load(&data)?;
@@ -416,16 +433,22 @@ fn main() -> Result<()> {
                 for &d in &distances {
                     for &sp in &speeds {
                         for &ex in &exits {
-                            let mut s = base.clone();
-                            s.decay = decay;
-                            s.trade_distance = d;
-                            s.entry_speed = sp;
-                            s.exit_speed = ex;
-                            match run_alpha(&panel, &alpha, &s) {
-                                Ok((_, m)) => rows.push((decay, d, sp, ex, m)),
-                                Err(e) => eprintln!(
-                                    "skip decay={decay} dist={d} speed={sp} exit={ex}: {e:#}"
-                                ),
+                            for &ms in &min_signals {
+                                for &mc in &min_changes {
+                                    let mut s = base.clone();
+                                    s.decay = decay;
+                                    s.trade_distance = d;
+                                    s.entry_speed = sp;
+                                    s.exit_speed = ex;
+                                    s.min_signal = ms;
+                                    s.min_signal_change = mc;
+                                    match run_alpha(&panel, &alpha, &s) {
+                                        Ok((_, m)) => rows.push((decay, d, sp, ex, ms, mc, m)),
+                                        Err(e) => eprintln!(
+                                            "skip decay={decay} dist={d} speed={sp} exit={ex} min_signal={ms} min_change={mc}: {e:#}"
+                                        ),
+                                    }
+                                }
                             }
                         }
                     }
@@ -438,8 +461,8 @@ fn main() -> Result<()> {
                 _ => m.fitness,
             };
             rows.sort_by(|a, b| {
-                key(&b.4)
-                    .partial_cmp(&key(&a.4))
+                key(&b.6)
+                    .partial_cmp(&key(&a.6))
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
             println!(
@@ -447,11 +470,13 @@ fn main() -> Result<()> {
                 base.cost_bps, base.gate_mode, base.distance_scope
             );
             println!(
-                "{:>5} {:>7} {:>6} {:>5} {:>8} {:>8} {:>8} {:>8} {:>8} {:>7} {:>7}",
+                "{:>5} {:>7} {:>6} {:>5} {:>7} {:>7} {:>8} {:>8} {:>8} {:>8} {:>8} {:>7} {:>7}",
                 "decay",
                 "dist",
                 "speed",
                 "exit",
+                "minsig",
+                "minchg",
                 "fitness",
                 "sharpe",
                 "ret%",
@@ -460,13 +485,15 @@ fn main() -> Result<()> {
                 "maxdd%",
                 "IC"
             );
-            for (decay, d, sp, ex, m) in rows {
+            for (decay, d, sp, ex, ms, mc, m) in rows {
                 println!(
-                    "{:>5} {:>7.3} {:>6.2} {:>5.2} {:>8.3} {:>8.3} {:>8.2} {:>8.1} {:>8.2} {:>7.2} {:>7.3}",
+                    "{:>5} {:>7.3} {:>6.2} {:>5.2} {:>7.4} {:>7.4} {:>8.3} {:>8.3} {:>8.2} {:>8.1} {:>8.2} {:>7.2} {:>7.3}",
                     decay,
                     d,
                     sp,
                     ex,
+                    ms,
+                    mc,
                     m.fitness,
                     m.sharpe,
                     m.annual_return * 100.0,
