@@ -43,7 +43,9 @@ quantTrading/
 │       ├── src/bin/wq-bt.rs         # run / batch / corr / check / ops / info
 │       └── alphas.example.txt       # sample alphas for `wq-bt batch`
 ├── research/                        # alpha notes (signal, settings, results, how to reproduce)
+├── tools/wq-report/build.py         # standard comparison page from `wq-bt run --out` dirs (see .claude/skills/wq-report)
 ├── tools/go-signer-check/           # Go program verifying Rust signatures with lighter-go
+├── .claude/skills/wq-report/        # skill: build + publish the standard backtest chart page
 ├── .env.example                     # LIGHTER_ACCOUNT_INDEX / LIGHTER_API_KEY_INDEX / LIGHTER_API_KEY_PRIVATE
 └── CLAUDE.md
 ```

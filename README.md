@@ -152,6 +152,12 @@ every name) and `ts_beta(y, x, d)` (rolling regression slope). Example, majors l
 `if_else(top_n(adv(24),5), 0, ts_beta(returns, mean_if(returns, top_n(adv(24),5)), 168) * mean_if(returns, top_n(adv(24),5)))`.
 Industry-group operators are not implemented because the universe has no sector data.
 
+## Charting results
+
+`tools/wq-report/build.py` turns one or more `wq-bt run --out` directories into the standard
+comparison page (cumulative PnL, gross/net exposure, daily and hour-of-day turnover, rolling win
+ratio, tables). The `wq-report` skill in `.claude/skills/` documents the workflow.
+
 ## Research notes
 
 Alpha write-ups live in `research/` (one Markdown file per signal, with settings, results and
