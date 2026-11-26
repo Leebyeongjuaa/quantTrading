@@ -48,6 +48,11 @@ Directional (no neutralization; long up-trends, short down-trends):
 - Filters that drop names create turnover through re-scaling; a version that holds a dropped
   name's weight at zero without re-scaling would trade less (not implemented).
 
+## Artifact
+
+https://claude.ai/artifact/RCwgarDDUK6pGN5UVaVtuE (directional R² 0.3 / no filter / R² 0.5 + 2σ,
+neutral R² 0.3, equal-weight long benchmark).
+
 ## Verdict
 
 Not a tradeable neutral alpha at 48h. If a directional trend sleeve is wanted, use the plain
