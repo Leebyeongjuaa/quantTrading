@@ -104,6 +104,35 @@ Panel: same 30 names, 5m bars, 2026-05-29 .. 2026-11-25 (51,840 bars). Signal
   BTC/ETH/SOL contribute about zero. Those names also have the widest spreads.
 - Conclusion unchanged: a liquidity-provision signal; harvestable only by resting orders.
 
+## Signal-level turnover filter (added 2026-11-26)
+
+The intended filter, implemented as `--min-signal θ` (names with |alpha| < θ keep their previous
+weight and stay out of the new book) and `--min-signal-change δ` (skip the rebalance when the
+mean |alpha − alpha at the last trade| over the significant names is below δ). Alpha units are
+1h return fractions. Full-trade-or-nothing, delay 0 on the 1h panel; hourly rebalance with a
+5-minute fill on the 5m panel.
+
+| panel | θ | δ | Sharpe 0 bps | turnover/day | margin | Sharpe 2 bps |
+|---|---|---|---|---|---|---|
+| 1h, 26 months | 0 | 0 | 5.93 | 3354% | 1.47 | -2.18 |
+| | 0.25% | 1% | 4.50 | 1374% | 2.31 | +0.61 |
+| | 0.5% | 0 | 4.02 | 1447% | 1.97 | -0.06 |
+| | 1% | 0.5% | 2.43 | 660% | 2.51 | +0.50 |
+| | 2% | 0 | 0.51 | 183% | 1.68 | -0.10 |
+| 5m, 180 days, 5-min fill | 0 | 0 | 8.85 | 3402% | 2.13 | +0.53 |
+| | 0.25% | 1% | 6.28 | 1405% | 3.15 | +2.28 |
+| | 0.5% | 1% | 5.95 | 1218% | 3.31 | +2.35 |
+| | 0.5% | 0.5% | 6.03 | 1408% | 2.88 | +1.83 |
+| | 1% | 1% | 2.99 | 616% | 3.21 | +1.13 |
+| | 2% | 0 | -0.35 | 181% | -1.18 | -0.95 |
+
+- The noise floor θ does most of the work: 0.25-0.5% removes 35-57% of turnover and lifts
+  margin from 1.5 to 2.0-2.3 bps while keeping 70-90% of the Sharpe. At 2% the signal is gone.
+- The change floor δ alone barely trades less until 1% (where it also halves the Sharpe); it
+  pays off in combination: θ 0.25% + δ 1% is the best cell on both panels.
+- Break-even cost moves from 1.5 to about 2.3 bps (26 months) / 3.2 bps (recent 180 days).
+  Still below a taker's cost on the alt names that produce the PnL.
+
 ## Open items
 
 1. Maker execution model (resting limit orders, fill probability), which is the only path left.
