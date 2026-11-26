@@ -111,6 +111,10 @@ pub const OPERATORS: &[(&str, &str)] = &[
         "ts_beta(y, x, d)",
         "rolling regression slope of y on x (cov/var)",
     ),
+    (
+        "ts_resid(x, d) ts_resid_z(x, d)",
+        "last point's residual from the OLS trend line over d bars (z: / residual std)",
+    ),
 ];
 
 fn valid(w: &[f64]) -> Vec<f64> {
@@ -519,6 +523,44 @@ impl<'a> Evaluator<'a> {
                     }
                 }
                 out
+            }
+            "ts_resid" | "ts_resid_z" => {
+                let d = self.arg_window(name, args, kwargs, 1)?;
+                let zscore = name == "ts_resid_z";
+                ts_apply(&x(0)?, d, move |w| {
+                    // OLS of x on bar index over the window; residual of the newest point.
+                    let pts: Vec<(f64, f64)> = w
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, v)| v.is_finite())
+                        .map(|(i, v)| (i as f64, *v))
+                        .collect();
+                    if pts.len() < min_count(d).max(3) || !w[w.len() - 1].is_finite() {
+                        return f64::NAN;
+                    }
+                    let n = pts.len() as f64;
+                    let mx = pts.iter().map(|p| p.0).sum::<f64>() / n;
+                    let my = pts.iter().map(|p| p.1).sum::<f64>() / n;
+                    let sxx: f64 = pts.iter().map(|p| (p.0 - mx).powi(2)).sum();
+                    let sxy: f64 = pts.iter().map(|p| (p.0 - mx) * (p.1 - my)).sum();
+                    if sxx <= 0.0 {
+                        return f64::NAN;
+                    }
+                    let slope = sxy / sxx;
+                    let fit = |t: f64| my + slope * (t - mx);
+                    let last_t = (w.len() - 1) as f64;
+                    let resid = w[w.len() - 1] - fit(last_t);
+                    if !zscore {
+                        return resid;
+                    }
+                    let var: f64 =
+                        pts.iter().map(|p| (p.1 - fit(p.0)).powi(2)).sum::<f64>() / (n - 2.0);
+                    if var > 0.0 {
+                        resid / var.sqrt()
+                    } else {
+                        f64::NAN
+                    }
+                })
             }
             "ts_beta" => {
                 let d = self.arg_window(name, args, kwargs, 2)?;
@@ -981,6 +1023,24 @@ mod tests {
         let h = hump(&x, 0.01);
         assert!(close(h.get(1, 0), 1.0));
         assert!(close(h.get(2, 0), 2.0));
+    }
+
+    #[test]
+    fn linear_trend_residual() {
+        let p = Panel::from_series(vec![(
+            "L".into(),
+            bars(0, &[10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 17.0]),
+        )])
+        .unwrap();
+        // Perfect line over the first six bars: residual 0.
+        let m = evaluate(&p, &parse("ts_resid(close, 6)").unwrap()).unwrap();
+        assert!(close(m.get(5, 0), 0.0));
+        // Window [11..15,17]: the last point sits above the OLS line (resid ~0.48).
+        let r = m.get(6, 0);
+        assert!(r > 0.3 && r < 1.0, "resid {r}");
+        let z = evaluate(&p, &parse("ts_resid_z(close, 6)").unwrap()).unwrap();
+        assert!(z.get(6, 0) > 1.0);
+        assert!(m.get(4, 0).is_nan());
     }
 
     #[test]
