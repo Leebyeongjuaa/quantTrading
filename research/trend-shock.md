@@ -63,6 +63,13 @@ Does the trend condition matter? (neutral, residual weight, 48h, z ≥ 2)
 The residual-weighted version holds up with a 5-minute fill (break-even 3 bps); the
 slope-weighted one does not. Same ordering as the 1h panel.
 
+## Artifact
+
+1h panel comparison (neutral residual z ≥ 2, neutral slope z ≥ 1.5, directional 24h z ≥ 2, and
+the with-trend shock control): https://claude.ai/artifact/QRiwAXQtieriXQXE76SE3a
+Rebuild with `tools/wq-report/build.py` from the four `wq-bt run --out` directories listed in
+the Results section's expressions.
+
 ## Open items
 
 1. ~~5m panel with hourly rebalance and 5-minute fill.~~ Done above.
