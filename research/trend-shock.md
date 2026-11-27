@@ -64,6 +64,35 @@ Bands instead of one-sided thresholds: [1, 2) 0.99, [1.5, 2.5) 1.61, [2, 3) 2.02
 - Bands do not help: the extreme tail (z > 2.5) is where the margin is, so capping |z| removes
   the best trades.
 
+## R² threshold ladder (1h panel, neutral, residual weight, 48h)
+
+R² 0.3 was inherited from the 48h trend-following note, not tuned. Sharpe at 0 bps / 2 bps:
+
+| R² ≥ | z ≥ 2 | turn/day | avg names L/S | z ≥ 1.5 | turn/day | avg names L/S |
+|---|---|---|---|---|---|---|
+| 0 (no trend filter) | 1.28 / -0.92 | 1006% | 0.8 / 0.8 | 2.12 / -0.77 | 1732% | 2.1 / 2.1 |
+| 0.1 | 1.80 / -0.42 | 858% | 0.7 / 0.7 | 2.45 / -0.39 | 1540% | 1.8 / 1.8 |
+| 0.2 | 2.13 / -0.08 | 789% | 0.6 / 0.6 | 2.52 / -0.25 | 1438% | 1.6 / 1.6 |
+| 0.3 | 2.41 / 0.33 | 715% | 0.5 / 0.5 | 2.76 / 0.10 | 1322% | 1.4 / 1.4 |
+| 0.4 | 1.84 / -0.17 | 639% | 0.5 / 0.4 | 3.03 / 0.46 | 1206% | 1.2 / 1.2 |
+| 0.45 | | | | 2.72 / 0.23 | 1140% | 1.1 / 1.1 |
+| 0.5 | 1.60 / -0.37 | 557% | 0.4 / 0.4 | 3.09 / 0.66 | 1061% | 1.0 / 1.0 |
+| 0.55 | | | | 2.60 / 0.18 | 985% | 0.9 / 0.9 |
+| 0.6 | 1.73 / -0.10 | 455% | 0.3 / 0.3 | 2.60 / 0.24 | 896% | 0.8 / 0.8 |
+| 0.7 | 0.30 / -1.43 | 333% | 0.2 / 0.2 | 1.15 / -0.98 | 672% | 0.5 / 0.5 |
+
+z ≥ 1.75: R² 0.3 2.60, 0.4 2.15, 0.5 2.28. 5m panel (180 d, hourly rebalance, 5 min fill):
+z 2 R² 0.3 3.78 vs R² 0.5 2.26; z 1.5 R² 0.3 2.27 vs R² 0.5 2.31.
+
+- Both ends are clearly worse: no trend filter (R² 0) loses 1-1.3 Sharpe and R² ≥ 0.7 leaves
+  almost no names. The filter matters.
+- Inside 0.2-0.6 the curve is bumpy, not monotone (z 2 peaks at 0.3, z 1.5 at 0.5, z 1.75 at
+  0.3, and 0.45 / 0.55 sit below 0.5). With 0.5-1.5 names in the book each step changes a
+  handful of trades, so the differences are noise. The 5m panel does not reproduce the z 1.5 /
+  R² 0.5 peak.
+- Keep R² 0.3: it is in the flat region, it has the most coverage within that region, and it
+  is the value shared with the trend-following note. Do not tune further on this sample.
+
 ## Reading
 
 - A sudden move against an established trend is a pullback to fade, not a reversal signal:
