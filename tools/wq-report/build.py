@@ -12,7 +12,7 @@ Each positional argument is `label=path` (optionally `label|short=path`). The pa
 <out>/index.html with <out>/data.json beside it (fetched at runtime), ready to publish with the
 Artifact tool: file_path=<out>/index.html, files={"data.json": "<out>/data.json"}.
 
-Charts: cumulative PnL (% of book), cumulative PnL after extra one-way costs (`--fees 3,5`,
+Charts: cumulative PnL (% of book), cumulative PnL after extra one-way costs (`--fees 1,2`,
 charged as traded dollars x bps per bar on top of the run's own cost setting), per-symbol PnL contribution bars and per-symbol cumulative lines (from `symbol_daily.csv`), gross and net exposure, daily turnover, hour-of-day turnover,
 30-day rolling bar win ratio, a metrics table and a monthly table. All series share one palette
 slot order (max 8); numbers are aggregated per UTC day so the page stays small.
@@ -345,7 +345,7 @@ def main():
     ap.add_argument("--subtitle", default="")
     ap.add_argument("--note", action="append", default=[], help="bullet for the notes section (repeatable)")
     ap.add_argument("--booksize", type=float, default=1_000_000.0)
-    ap.add_argument("--fees", default="3,5", help="comma-separated one-way costs in bps for the after-fee cumulative PnL charts ('' to disable)")
+    ap.add_argument("--fees", default="1,2", help="comma-separated one-way costs in bps for the after-fee cumulative PnL charts ('' to disable)")
     ap.add_argument("--out", required=True)
     ap.add_argument("series", nargs="+", help="label=path or label|short=path (max 8)")
     a = ap.parse_args()

@@ -49,7 +49,7 @@ new page takes minutes, not an hour.
 ## What the page shows
 
 Tiles (Sharpe, annual return, margin, turnover/day, bar win ratio, average gross) per run;
-cumulative PnL as % of book, then the same after extra one-way costs (`--fees 3,5` by default,
+cumulative PnL as % of book, then the same after extra one-way costs (`--fees 1,2` by default,
 charged per bar as traded dollars × bps on top of the run's own `--cost-bps`; run at cost 0 so
 the fee charts mean what they say); per-symbol PnL contribution bars for every run and
 per-symbol cumulative PnL lines for the first run (top/bottom 3 contributors in colour, from
