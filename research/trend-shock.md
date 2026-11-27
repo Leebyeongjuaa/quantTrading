@@ -1,6 +1,6 @@
 # Alpha note: counter-trend shock inside a trend (buy the dip / sell the rip)
 
-Status: research, promising but sparse. Last updated 2026-11-26.
+Status: research, promising but sparse. Last updated 2026-11-27.
 
 ## Signal
 
@@ -15,7 +15,7 @@ keep_if(ts_slope(log(close), 48),
         && ts_resid_z(log(close), 48) * ts_slope(log(close), 48) < 0)
 ```
 
-Variants: weight by the residual (`-ts_resid(...)`) instead of the slope; 24h window; z 1.5/2/3;
+Variants: weight by the residual (`-ts_resid(...)`) instead of the slope; 24h window; z 0.5-4;
 directional (no neutralization) or market neutral.
 
 ## Results (1h panel, 26 months, delay 0)
@@ -39,6 +39,31 @@ Does the trend condition matter? (neutral, residual weight, 48h, z ≥ 2)
 | any 2σ deviation, no trend test | 0.79 | 1565% | 0.70 | 83% |
 | plain 24h residual reversal (`reversal-24h-trend.md`) | 4.04 | 1301% | 2.58 | 22% |
 
+## z threshold ladder (1h panel, neutral, residual weight, 48h, R² ≥ 0.3)
+
+| z ≥ | Sharpe 0 bps | Sharpe 2 bps | annual ret | turnover/day | margin | max DD | avg names L/S | avg gross | yearly Sharpe |
+|---|---|---|---|---|---|---|---|---|---|
+| 0.5 | 1.95 | -0.64 | | | | | | | |
+| 1.0 | 2.07 | -0.62 | | 1667% | 1.54 | 50% | 2.7 / 2.8 | 75% | |
+| 1.25 | 2.52 | -0.19 | | | | | | | |
+| 1.5 | 2.76 | 0.10 | +100% | 1322% | 2.07 | 24% | 1.4 / 1.4 | 48% | 5.5 / 3.1 / 1.7 |
+| 1.75 | 2.60 | 0.14 | | 1027% | 2.11 | 16% | | | |
+| 2.0 | 2.42 | 0.34 | +61% | 715% | 2.32 | 16% | 0.5 / 0.5 | 22% | 1.0 / 3.0 / 2.1 |
+| 2.5 | 1.01 | -0.27 | | 264% | | | | 7% | |
+| 3.0 | 1.16 | 0.57 | +12% | 82% | 3.88 | 9% | ~0 | 2% | |
+| 4.0 | 1.67 | 1.44 | | 7.5% | | | ~0 | tiny | |
+
+Bands instead of one-sided thresholds: [1, 2) 0.99, [1.5, 2.5) 1.61, [2, 3) 2.02 (Sharpe, 0 bps).
+
+- Sharpe peaks at z 1.5-1.75 and margin rises monotonically with z, but coverage collapses:
+  above z 2.5 the book holds well under one name on average and the PnL is a handful of
+  trades. z 3 / z 4 Sharpe numbers are not meaningful.
+- Below z 1.25 noise entries dominate: turnover > 1300%/day and the 2 bps Sharpe is negative.
+- Practical range z 1.5-2.0: z 1.5 has the best raw Sharpe and most coverage (48% gross),
+  z 2 has the best margin and after-cost result (0.34 at 2 bps) with half the gross exposure.
+- Bands do not help: the extreme tail (z > 2.5) is where the margin is, so capping |z| removes
+  the best trades.
+
 ## Reading
 
 - A sudden move against an established trend is a pullback to fade, not a reversal signal:
@@ -52,6 +77,10 @@ Does the trend condition matter? (neutral, residual weight, 48h, z ≥ 2)
   turnover is high because names enter and exit the book abruptly.
 - Compared with the unconditional 24h residual reversal (Sharpe 4.0, 22% DD), this is a subset
   with lower Sharpe but shallower drawdown (16%) and a clearer story.
+- Intended use case: an established trend (R² ≥ 0.3) where the name gets knocked against the
+  trend by a market-wide move, a liquidation cascade or a short-covering burst, and reverts to
+  the trend line within hours. It fails when the shock is the first bar of a real reversal
+  (fundamental news) and it is not designed for with-trend blow-offs.
 
 ## 5m panel (180 days, hourly rebalance, 5-minute fill, neutral)
 
@@ -65,10 +94,11 @@ slope-weighted one does not. Same ordering as the 1h panel.
 
 ## Artifact
 
-1h panel comparison (neutral residual z ≥ 2, neutral slope z ≥ 1.5, directional 24h z ≥ 2, and
-the with-trend shock control): https://claude.ai/artifact/QRiwAXQtieriXQXE76SE3a
-Rebuild with `tools/wq-report/build.py` from the four `wq-bt run --out` directories listed in
-the Results section's expressions.
+1h panel comparison (neutral residual z ≥ 1.5 / 2 / 3, neutral slope z ≥ 1.5, directional 24h
+z ≥ 2, and the with-trend shock control), with an intro card describing the intent and the
+situations where it does and does not work: https://claude.ai/artifact/QRiwAXQtieriXQXE76SE3a
+Rebuild with `tools/wq-report/build.py --intro ...` from the six `wq-bt run --out` directories
+listed in the Results section's expressions.
 
 ## Open items
 

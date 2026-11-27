@@ -30,10 +30,21 @@ new page takes minutes, not an hour.
    python3 tools/wq-report/build.py \
      --title "<short name, 2-4 words>" \
      --subtitle "<universe · bars · period · key settings · cost>" \
+     --intro "의도: <what the strategy bets on and how the signal is built>" \
+     --intro "잘 먹히는 상황: 
+- <concrete market situation>
+- <another>" \
+     --intro "안 먹히는 상황: 
+- <failure mode, with the number that shows it if there is one>" \
      --note "<one finding>" --note "<another finding>" \
      --out <report-dir> \
      "<legend label>|<short end-label>=<runs>/<name>" ...
    ```
+
+   `--intro` is repeatable and renders as a card right under the title: text before the first
+   colon is the block heading, the rest is paragraphs, and lines starting with `- ` become
+   bullets. Always give the three blocks above (intent / where it works with example situations
+   / where it fails) so a reader who has not followed the conversation understands the page.
 
    The first series gets palette slot 1 (blue), the second orange, then aqua, yellow; keep the
    baseline first so colours stay stable across pages. Labels are Korean when the conversation is.

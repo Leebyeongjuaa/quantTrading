@@ -158,6 +158,11 @@ td.pos { color: var(--pos); }
 .scroll { overflow-x: auto; }
 .notes { color: var(--ink-2); font-size: 13px; display: grid; gap: 6px; padding-left: 18px; margin: 0; }
 .rel { color: var(--muted); font-size: 12px; }
+.intro { display: grid; gap: 12px; }
+.intro h3 { margin: 0 0 4px; font-size: 13px; font-weight: 600; color: var(--ink-2); letter-spacing: 0.02em; text-transform: uppercase; }
+.intro p { margin: 0; max-width: 72ch; }
+.intro ul { margin: 0; padding-left: 18px; max-width: 72ch; }
+.intro li { margin: 2px 0; }
 .err { color: var(--neg); }
 .sbar { cursor: default; }
 .sbar:hover, .sbar:focus { filter: brightness(1.12); outline: none; }
@@ -165,6 +170,7 @@ td.pos { color: var(--pos); }
 </style>
 <main>
   <header><h1>__TITLE__</h1><p class="sub">__SUBTITLE__</p></header>
+  __INTRO__
   <section class="tiles" id="tiles"></section>
   <section class="card"><div class="head"><div><h2>누적 PnL (북 대비 %)</h2><div class="rel">일 단위 집계. 노출이 낮은 설정은 북 대비 수익률이 작게 보이므로 Sharpe와 margin으로 비교.</div></div><div class="legend" data-legend></div></div><div class="chart" id="cum"></div></section>
   <div id="fee-sections" style="display: contents"></div>
@@ -344,6 +350,8 @@ def main():
     ap.add_argument("--title", required=True)
     ap.add_argument("--subtitle", default="")
     ap.add_argument("--note", action="append", default=[], help="bullet for the notes section (repeatable)")
+    ap.add_argument("--intro", action="append", default=[],
+                    help="intro block under the title, repeatable: 'Heading: text' (text paragraphs; lines starting with '- ' become bullets)")
     ap.add_argument("--booksize", type=float, default=1_000_000.0)
     ap.add_argument("--fees", default="1,2", help="comma-separated one-way costs in bps for the after-fee cumulative PnL charts ('' to disable)")
     ap.add_argument("--out", required=True)
@@ -366,9 +374,25 @@ def main():
     notes = ""
     if a.note:
         notes = '<section class="card"><h2>읽는 법</h2><ul class="notes">' + "".join(f"<li>{esc(n)}</li>" for n in a.note) + "</ul></section>"
+    intro = ""
+    if a.intro:
+        blocks = []
+        for raw in a.intro:
+            head, _, body = raw.partition(":")
+            if not body:
+                head, body = "", raw
+            lines = [ln.strip() for ln in body.strip().split("\n") if ln.strip()]
+            bullets = [ln[2:] for ln in lines if ln.startswith("- ")]
+            paras = [ln for ln in lines if not ln.startswith("- ")]
+            html_b = (f"<h3>{esc(head.strip())}</h3>" if head.strip() else "")
+            html_b += "".join(f"<p>{esc(pg)}</p>" for pg in paras)
+            if bullets:
+                html_b += "<ul>" + "".join(f"<li>{esc(b)}</li>" for b in bullets) + "</ul>"
+            blocks.append(f"<div>{html_b}</div>")
+        intro = '<section class="card intro">' + "".join(blocks) + "</section>"
     light = " ".join(f"--s{i + 1}: {PALETTE[i][0]};" for i in range(len(PALETTE)))
     dark = " ".join(f"--s{i + 1}: {PALETTE[i][1]};" for i in range(len(PALETTE)))
-    html = (TEMPLATE.replace("__TITLE__", esc(a.title)).replace("__SUBTITLE__", esc(a.subtitle)).replace("__NOTES__", notes)
+    html = (TEMPLATE.replace("__TITLE__", esc(a.title)).replace("__SUBTITLE__", esc(a.subtitle)).replace("__NOTES__", notes).replace("__INTRO__", intro)
             .replace("__LIGHT_SLOTS__", light).replace("__DARK_SLOTS__", dark))
     open(os.path.join(a.out, "index.html"), "w").write(html)
     print(f"wrote {a.out}/index.html and data.json ({os.path.getsize(os.path.join(a.out, 'data.json'))} bytes)")
